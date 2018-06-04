@@ -22,6 +22,19 @@
 #include <stout/flags.hpp>
 #include <stout/option.hpp>
 
+#include <mesos/module/module.hpp>
+#include <mesos/type_utils.hpp>
+
+#include <stout/error.hpp>
+#include <stout/json.hpp>
+#include <stout/os.hpp>
+#include <stout/path.hpp>
+
+#include "common/http.hpp"
+#include "common/parse.hpp"
+#include "common/protobuf_utils.hpp"
+
+
 #include "logging/flags.hpp"
 
 namespace mesos {
@@ -69,9 +82,29 @@ public:
         "role",
         "Role to use when registering.",
         "*");
+
+    add(&Flags::master_detector,
+        "master_detector",
+        "The symbol name of the master detector to use. This symbol\n"
+        "should exist in a module specified through the --modules flag.\n"
+        "Cannot be used in conjunction with --zk.\n");
+
+    add(&Flags::modules,
+        "modules",
+        "List of modules to be loaded and be available to the internal\n"
+        "subsystems.\n"
+        "\n"
+        "Use `--modules=filepath` to specify the list of modules via a\n"
+        "file containing a JSON-formatted string. `filepath` can be\n"
+        "of the form `file:///path/to/file` or `/path/to/file`.\n"
+        "\n"
+        "Use `--modules=\"{...}\"` to specify the list of modules inline.\n"
+        "Cannot be used in conjunction with --modules_dir.\n");
   }
 
-  std::string master;
+  Option<Modules> modules;
+  Option<std::string> master_detector;
+  Option<std::string> master;
   bool authenticate;
   std::string principal;
   Option<std::string> secret;

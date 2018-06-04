@@ -22,9 +22,11 @@
 #include <mesos/resources.hpp>
 #include <mesos/scheduler.hpp>
 #include <mesos/type_utils.hpp>
+#include <mesos/master/detector.hpp>
 
 #include <mesos/authorizer/acls.hpp>
 
+#include <stout/try.hpp>
 #include <stout/check.hpp>
 #include <stout/exit.hpp>
 #include <stout/flags.hpp>
@@ -39,10 +41,13 @@
 
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
+#include "module/manager.hpp"
 
 #include "examples/flags.hpp"
 
 using namespace mesos;
+using mesos::modules::ModuleManager;
+using mesos::master::detector::MasterDetector;
 
 using boost::lexical_cast;
 
@@ -233,6 +238,11 @@ int main(int argc, char** argv)
 
   Try<flags::Warnings> load = flags.load("MESOS_EXAMPLE_", argc, argv);
 
+  // TODO(erin): change hacky workaround
+  if (!flags.master.isSome()) {
+     flags.master = Option<std::string>("");
+  }
+
   if (flags.help) {
     cout << flags.usage() << endl;
     return EXIT_SUCCESS;
@@ -248,6 +258,13 @@ int main(int argc, char** argv)
   // Log any flag warnings (after logging is initialized).
   foreach (const flags::Warning& warning, load->warnings) {
     LOG(WARNING) << warning.message;
+  }
+
+  if (flags.modules.isSome()) {
+    Try<Nothing> result = ModuleManager::load(flags.modules.get());
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
+    }
   }
 
   ExecutorInfo executor;
@@ -273,7 +290,7 @@ int main(int argc, char** argv)
     implicitAcknowledgements = false;
   }
 
-  if (flags.master == "local") {
+  if (flags.master.get() == "local") {
     // Configure master.
     os::setenv("MESOS_ROLES", flags.role);
     os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", stringify(flags.authenticate));
@@ -303,14 +320,14 @@ int main(int argc, char** argv)
     driver = new MesosSchedulerDriver(
         &scheduler,
         framework,
-        flags.master,
+        flags.master.get(),
         implicitAcknowledgements,
         credential);
   } else {
     driver = new MesosSchedulerDriver(
         &scheduler,
         framework,
-        flags.master,
+        flags.master.get(),
         implicitAcknowledgements);
   }
 

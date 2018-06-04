@@ -123,12 +123,19 @@ public:
         "authentication_timeout",
         "Timeout after which authentication will be retried.",
         DEFAULT_AUTHENTICATION_TIMEOUT);
+
+    add(&Flags::master_detector,
+        "master_detector",
+        "The symbol name of the master detector to use. This symbol\n"
+        "should exist in a module specified through the --modules flag.\n"
+        "Cannot be used in conjunction with --zk.\n");
   }
 
   Duration authentication_backoff_factor;
   Duration registration_backoff_factor;
   Option<Modules> modules;
   Option<std::string> modulesDir;
+  Option<std::string> master_detector;
   std::string authenticatee;
   Duration authentication_timeout;
 };

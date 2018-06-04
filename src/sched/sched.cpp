@@ -137,7 +137,8 @@ class DetectorPool
 public:
   virtual ~DetectorPool() {}
 
-  static Try<shared_ptr<MasterDetector>> get(const string& url)
+  static Try<shared_ptr<MasterDetector>> get(const string url,
+      const Option<string> masterDetectorModule)
   {
     synchronized (DetectorPool::instance()->poolMutex) {
       // Get or create the `weak_ptr` map entry.
@@ -149,7 +150,8 @@ public:
         return result;
       } else {
         // Else, create the master detector and record it in the map.
-        Try<MasterDetector*> detector = MasterDetector::create(url);
+        Try<MasterDetector*> detector =
+            MasterDetector::create(url, masterDetectorModule);
         if (detector.isError()) {
           return Error(detector.error());
         }
@@ -1912,21 +1914,6 @@ Status MesosSchedulerDriver::start()
       return status;
     }
 
-    if (detector == nullptr) {
-      Try<shared_ptr<MasterDetector>> detector_ = DetectorPool::get(url);
-
-      if (detector_.isError()) {
-        status = DRIVER_ABORTED;
-        string message = "Failed to create a master detector for '" +
-        master + "': " + detector_.error();
-        scheduler->error(this, message);
-        return status;
-      }
-
-      // Save the detector so we can delete it later.
-      detector = detector_.get();
-    }
-
     // Load scheduler flags.
     internal::scheduler::Flags flags;
     Try<flags::Warnings> load = flags.load("MESOS_");
@@ -1962,6 +1949,7 @@ Status MesosSchedulerDriver::start()
       }
     }
 
+    // load in modules
     if (flags.modules.isSome()) {
       Try<Nothing> result = modules::ModuleManager::load(flags.modules.get());
       if (result.isError()) {
@@ -1969,6 +1957,23 @@ Status MesosSchedulerDriver::start()
         scheduler->error(this, "Error loading modules: " + result.error());
         return status;
       }
+    }
+
+    // create detector if one doesn't exist
+    if (detector == nullptr) {
+      Try<shared_ptr<MasterDetector>> detector_ =
+              DetectorPool::get(url, flags.master_detector);
+
+      if (detector_.isError()) {
+        status = DRIVER_ABORTED;
+        string message = "Failed to create a master detector for '" +
+        master + "': " + detector_.error();
+        scheduler->error(this, message);
+        return status;
+      }
+
+      // Save the detector so we can delete it later.
+      detector = detector_.get();
     }
 
     CHECK(process == nullptr);
