@@ -94,6 +94,7 @@
 #include "module/manager.hpp"
 
 #include "sched/constants.hpp"
+#include "sched/detector_pool.hpp"
 #include "sched/flags.hpp"
 
 #include "version/version.hpp"
@@ -104,6 +105,7 @@ using namespace mesos::internal::master;
 using namespace mesos::scheduler;
 
 using mesos::master::detector::MasterDetector;
+using mesos::internal::DetectorPool;
 
 using process::Clock;
 using process::DispatchEvent;
@@ -126,61 +128,6 @@ using utils::copy;
 
 namespace mesos {
 namespace internal {
-
-
-// The DetectorPool is responsible for tracking single detector per url
-// to avoid having multiple detectors per url when multiple frameworks
-// are instantiated per process. See MESOS-3595.
-
-class DetectorPool
-{
-public:
-  virtual ~DetectorPool() {}
-
-  static Try<shared_ptr<MasterDetector>> get(const string url,
-      const Option<string> masterDetectorModule)
-  {
-    synchronized (DetectorPool::instance()->poolMutex) {
-      // Get or create the `weak_ptr` map entry.
-      shared_ptr<MasterDetector> result =
-        DetectorPool::instance()->pool[url].lock();
-
-      if (result) {
-        // Return existing master detector.
-        return result;
-      } else {
-        // Else, create the master detector and record it in the map.
-        Try<MasterDetector*> detector =
-            MasterDetector::create(url, masterDetectorModule);
-        if (detector.isError()) {
-          return Error(detector.error());
-        }
-
-        result = shared_ptr<MasterDetector>(detector.get());
-        DetectorPool::instance()->pool[url] = result;
-        return result;
-      }
-    }
-  }
-
-private:
-  // Hide the constructors and assignment operator.
-  DetectorPool() {}
-  DetectorPool(const DetectorPool&) = delete;
-  DetectorPool& operator=(const DetectorPool&) = delete;
-
-  // Instead of having multiple detectors for multiple frameworks,
-  // keep track of one detector per url.
-  hashmap<string, weak_ptr<MasterDetector>> pool;
-  std::mutex poolMutex;
-
-  // Internal Singleton.
-  static DetectorPool* instance()
-  {
-    static DetectorPool* singleton = new DetectorPool();
-    return singleton;
-  }
-};
 
 // The scheduler process (below) is responsible for interacting with
 // the master and responding to Mesos API calls from scheduler
