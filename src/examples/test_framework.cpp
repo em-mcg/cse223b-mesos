@@ -16,6 +16,7 @@
 
 #include <iostream>
 #include <string>
+#include <mutex>
 
 #include <boost/lexical_cast.hpp>
 
@@ -57,11 +58,14 @@ using std::endl;
 using std::flush;
 using std::string;
 using std::vector;
+using std::mutex;
 
 using mesos::Resources;
 
+mutex mutx;
+
 const int32_t CPUS_PER_TASK = 1;
-const int32_t MEM_PER_TASK = 128;
+const int32_t MEM_PER_TASK = 90;
 
 constexpr char EXECUTOR_BINARY[] = "test-executor";
 constexpr char EXECUTOR_NAME[] = "Test Executor (C++)";
@@ -79,7 +83,7 @@ public:
       role(_role),
       tasksLaunched(0),
       tasksFinished(0),
-      totalTasks(5) {}
+      totalTasks(2) {}
 
   virtual ~TestScheduler() {}
 
@@ -101,6 +105,8 @@ public:
       cout << "Received offer " << offer.id() << " with " << offer.resources()
            << endl;
 
+      cout << "Have " << totalTasks - tasksLaunched << " tasks left" << endl;
+
       Resources taskResources = Resources::parse(
           "cpus:" + stringify(CPUS_PER_TASK) +
           ";mem:" + stringify(MEM_PER_TASK)).get();
@@ -110,9 +116,12 @@ public:
 
       // Launch tasks.
       vector<TaskInfo> tasks;
+
       while (tasksLaunched < totalTasks &&
              remaining.toUnreserved().contains(taskResources)) {
-        int taskId = tasksLaunched++;
+        mutx.lock();
+        int taskId = tasksLaunched;
+        mutx.unlock();
 
         cout << "Launching task " << taskId << " using offer "
              << offer.id() << endl;
@@ -139,11 +148,16 @@ public:
         task.mutable_resources()->MergeFrom(resources.get());
         remaining -= resources.get();
 
+        mutx.lock();
+        tasksLaunched++;
+        mutx.unlock();
         tasks.push_back(task);
       }
 
       driver->launchTasks(offer.id(), tasks);
     }
+
+    cout << "Done launching tasks" << endl;
   }
 
   virtual void offerRescinded(SchedulerDriver* driver, const OfferID& offerId)
@@ -154,10 +168,6 @@ public:
     int taskId = lexical_cast<int>(status.task_id().value());
 
     cout << "Task " << taskId << " is in state " << status.state() << endl;
-
-    if (status.state() == TASK_FINISHED) {
-      tasksFinished++;
-    }
 
     if (status.state() == TASK_LOST ||
         status.state() == TASK_KILLED ||
@@ -173,6 +183,14 @@ public:
     if (!implicitAcknowledgements) {
       driver->acknowledgeStatusUpdate(status);
     }
+
+    mutx.lock();
+    if (status.state() == TASK_FINISHED) {
+      tasksFinished++;
+    }
+
+    cout << "Finished " << tasksFinished << " tasks" << endl;
+    mutx.unlock();
 
     if (tasksFinished == totalTasks) {
       driver->stop();
@@ -305,7 +323,7 @@ int main(int argc, char** argv)
     os::setenv("MESOS_DEFAULT_ROLE", flags.role);
   }
 
-  MesosSchedulerDriver* driver;
+  MultiMesosSchedulerDriver* driver;
   TestScheduler scheduler(implicitAcknowledgements, executor, flags.role);
 
   if (flags.authenticate) {
@@ -317,14 +335,14 @@ int main(int argc, char** argv)
       credential.set_secret(flags.secret.get());
     }
 
-    driver = new MesosSchedulerDriver(
+    driver = new MultiMesosSchedulerDriver(
         &scheduler,
         framework,
         flags.master.get(),
         implicitAcknowledgements,
         credential);
   } else {
-    driver = new MesosSchedulerDriver(
+    driver = new MultiMesosSchedulerDriver(
         &scheduler,
         framework,
         flags.master.get(),

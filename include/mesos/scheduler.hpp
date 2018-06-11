@@ -49,6 +49,10 @@ namespace internal {
 class SchedulerProcess;
 } // namespace internal {
 
+namespace internal {
+class MultiMasterSchedulerProcess;
+} // namespace internal {
+
 namespace master {
 namespace detector {
 class MasterDetector;
@@ -464,6 +468,149 @@ private:
 
   // Used for communicating with the master.
   internal::SchedulerProcess* process;
+
+  // URL for the master (e.g., zk://, file://, etc).
+  std::string url;
+
+  // Mutex for enforcing serial execution of all non-callbacks.
+  std::recursive_mutex mutex;
+
+  // Latch for waiting until driver terminates.
+  process::Latch* latch;
+
+  // Current status of the driver.
+  Status status;
+
+  const bool implicitAcknowlegements;
+
+  const Credential* credential;
+
+  // Scheduler process ID.
+  std::string schedulerId;
+};
+
+
+class MultiMesosSchedulerDriver : public SchedulerDriver
+{
+public:
+  // Creates a new driver for the specified scheduler. The master
+  // should be one of:
+  //
+  //     host:port
+  //     zk://host1:port1,host2:port2,.../path
+  //     zk://username:password@host1:port1,host2:port2,.../path
+  //     file:///path/to/file (where file contains one of the above)
+  //
+  // The driver will attempt to "failover" if the specified
+  // FrameworkInfo includes a valid FrameworkID.
+  //
+  // Any Mesos configuration options are read from environment
+  // variables, as well as any configuration files found through the
+  // environment variables.
+  //
+  // TODO(vinod): Deprecate this once 'MesosSchedulerDriver' can take
+  // 'Option<Credential>' as parameter. Currently it cannot because
+  // 'stout' is not visible from here.
+  MultiMesosSchedulerDriver(
+      Scheduler* scheduler,
+      const FrameworkInfo& framework,
+      const std::string& master);
+
+  // Same as the above constructor but takes 'credential' as argument.
+  // The credential will be used for authenticating with the master.
+  MultiMesosSchedulerDriver(
+      Scheduler* scheduler,
+      const FrameworkInfo& framework,
+      const std::string& master,
+      const Credential& credential);
+
+  // These constructors are the same as the above two, but allow
+  // the framework to specify whether implicit or explicit
+  // acknowledgements are desired. See statusUpdate() for the
+  // details about explicit acknowledgements.
+  //
+  // TODO(bmahler): Deprecate the above two constructors. In 0.22.0
+  // these new constructors are exposed.
+  MultiMesosSchedulerDriver(
+      Scheduler* scheduler,
+      const FrameworkInfo& framework,
+      const std::string& master,
+      bool implicitAcknowledgements);
+
+  MultiMesosSchedulerDriver(
+      Scheduler* scheduler,
+      const FrameworkInfo& framework,
+      const std::string& master,
+      bool implicitAcknowlegements,
+      const Credential& credential);
+
+  // This destructor will block indefinitely if
+  // MesosSchedulerDriver::start was invoked successfully (possibly
+  // via MesosSchedulerDriver::run) and MesosSchedulerDriver::stop has
+  // not been invoked.
+  virtual ~MultiMesosSchedulerDriver();
+
+  // See SchedulerDriver for descriptions of these.
+  virtual Status start();
+  virtual Status stop(bool failover = false);
+  virtual Status abort();
+  virtual Status join();
+  virtual Status run();
+
+  virtual Status requestResources(
+      const std::vector<Request>& requests);
+
+  // TODO(nnielsen): launchTasks using single offer is deprecated.
+  // Use launchTasks with offer list instead.
+  virtual Status launchTasks(
+      const OfferID& offerId,
+      const std::vector<TaskInfo>& tasks,
+      const Filters& filters = Filters());
+
+  virtual Status launchTasks(
+      const std::vector<OfferID>& offerIds,
+      const std::vector<TaskInfo>& tasks,
+      const Filters& filters = Filters());
+
+  virtual Status killTask(const TaskID& taskId);
+
+  virtual Status acceptOffers(
+      const std::vector<OfferID>& offerIds,
+      const std::vector<Offer::Operation>& operations,
+      const Filters& filters = Filters());
+
+  virtual Status declineOffer(
+      const OfferID& offerId,
+      const Filters& filters = Filters());
+
+  virtual Status reviveOffers();
+
+  virtual Status suppressOffers();
+
+  virtual Status acknowledgeStatusUpdate(
+      const TaskStatus& status);
+
+  virtual Status sendFrameworkMessage(
+      const ExecutorID& executorId,
+      const SlaveID& slaveId,
+      const std::string& data);
+
+  virtual Status reconcileTasks(
+      const std::vector<TaskStatus>& statuses);
+
+protected:
+  // Used to detect (i.e., choose) the master.
+  std::shared_ptr<master::detector::MasterDetector> detector;
+
+private:
+  void initialize();
+
+  Scheduler* scheduler;
+  FrameworkInfo framework;
+  std::string master;
+
+  // Used for communicating with the master.
+  internal::MultiMasterSchedulerProcess* process;
 
   // URL for the master (e.g., zk://, file://, etc).
   std::string url;

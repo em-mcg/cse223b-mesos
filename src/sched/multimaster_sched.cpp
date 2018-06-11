@@ -131,6 +131,15 @@ using mesos::internal::DetectorPool;
 namespace mesos {
 namespace internal {
 
+typedef struct {
+  // map SlaveID to slave UPID
+  // TODO(erin): figure out why this is a map
+  hashmap<SlaveID, UPID> slaveMap;
+
+  // master we got the offer from
+  UPID master;
+} OfferInfo;
+
 // TODO(erin): do this in a better way
 bool doesMasterExist(std::vector<Option<MasterInfo>> masters,
   Option<MasterInfo> master) {
@@ -141,12 +150,28 @@ bool doesMasterExist(std::vector<Option<MasterInfo>> masters,
 
   for (auto const& m : masters) {
     if (m->pid() == master->pid()) {
+      LOG(INFO) << "Matched master with PID " << master->pid();
       return true;
     }
   }
 
   return false;
 }
+
+
+Option<MasterInfo> doesUPIDExist(std::vector<Option<MasterInfo>> masters,
+  const UPID& from) {
+
+  for (const Option<MasterInfo> m : masters) {
+    if (from == m->pid()) {
+      LOG(INFO) << "Matched master with PID " << m->pid();
+      return m;
+    }
+  }
+
+  return Option<MasterInfo>::none();
+}
+
 
 // The scheduler process (below) is responsible for interacting with
 // the master and responding to Mesos API calls from scheduler
@@ -157,22 +182,27 @@ bool doesMasterExist(std::vector<Option<MasterInfo>> masters,
 class MultiMasterSchedulerProcess: public ProtobufProcess<
   MultiMasterSchedulerProcess> {
 public:
-  MultiMasterSchedulerProcess(MesosSchedulerDriver* _driver,
-    Scheduler* _scheduler, const FrameworkInfo& _framework,
-    const Option<Credential>& _credential, bool _implicitAcknowledgements,
-    const string& schedulerId, MasterDetector* _detector,
-    const internal::scheduler::Flags& _flags, std::recursive_mutex* _mutex,
+  MultiMasterSchedulerProcess(
+    MultiMesosSchedulerDriver* _driver,
+    Scheduler* _scheduler,
+    const FrameworkInfo& _framework,
+    const Option<Credential>& _credential,
+    bool _implicitAcknowledgements,
+    const string& schedulerId,
+    MasterDetector* _detector,
+    const internal::scheduler::Flags& _flags,
+    std::recursive_mutex* _mutex,
     Latch* _latch)
-// We use a UUID here to ensure that the master can reliably
-// distinguish between scheduler runs. Otherwise the master may
-// receive a delayed ExitedEvent enqueued behind a
-// re-registration, and deactivate the framework incorrectly.
-// TODO(bmahler): Investigate better ways to solve this problem.
-// Check if bidirectional links in Erlang provides better
-// semantics:
-// http://www.erlang.org/doc/reference_manual/processes.html#id84804.
-// Consider using unique PIDs throughout libprocess and relying
-// on name registration to identify the process without the PID.
+  // We use a UUID here to ensure that the master can reliably
+  // distinguish between scheduler runs. Otherwise the master may
+  // receive a delayed ExitedEvent enqueued behind a
+  // re-registration, and deactivate the framework incorrectly.
+  // TODO(bmahler): Investigate better ways to solve this problem.
+  // Check if bidirectional links in Erlang provides better
+  // semantics:
+  // http://www.erlang.org/doc/reference_manual/processes.html#id84804.
+  // Consider using unique PIDs throughout libprocess and relying
+  // on name registration to identify the process without the PID.
   : ProcessBase(schedulerId),
     metrics(*this),
     driver(_driver),
@@ -202,45 +232,45 @@ public:
 
 protected:
   virtual void initialize() {
-    install<Event>(&SchedulerProcess::receive);
+    install<Event>(&MultiMasterSchedulerProcess::receive);
 
-// TODO(benh): Get access to flags so that we can decide whether
-// or not to make ZooKeeper verbose.
-    install<FrameworkRegisteredMessage>(&SchedulerProcess::registered,
+    // TODO(benh): Get access to flags so that we can decide whether
+    // or not to make ZooKeeper verbose.
+    install<FrameworkRegisteredMessage>(&MultiMasterSchedulerProcess::registered,
       &FrameworkRegisteredMessage::framework_id,
       &FrameworkRegisteredMessage::master_info);
 
-    install<FrameworkReregisteredMessage>(&SchedulerProcess::reregistered,
+    install<FrameworkReregisteredMessage>(&MultiMasterSchedulerProcess::reregistered,
       &FrameworkReregisteredMessage::framework_id,
       &FrameworkReregisteredMessage::master_info);
 
-    install<ResourceOffersMessage>(&SchedulerProcess::resourceOffers,
+    install<ResourceOffersMessage>(&MultiMasterSchedulerProcess::resourceOffers,
       &ResourceOffersMessage::offers, &ResourceOffersMessage::pids);
 
-    install<RescindResourceOfferMessage>(&SchedulerProcess::rescindOffer,
+    install<RescindResourceOfferMessage>(&MultiMasterSchedulerProcess::rescindOffer,
       &RescindResourceOfferMessage::offer_id);
 
-    install<StatusUpdateMessage>(&SchedulerProcess::statusUpdate,
+    install<StatusUpdateMessage>(&MultiMasterSchedulerProcess::statusUpdate,
       &StatusUpdateMessage::update, &StatusUpdateMessage::pid);
 
-    install<LostSlaveMessage>(&SchedulerProcess::lostSlave,
+    install<LostSlaveMessage>(&MultiMasterSchedulerProcess::lostSlave,
       &LostSlaveMessage::slave_id);
 
-    install<ExitedExecutorMessage>(&SchedulerProcess::lostExecutor,
+    install<ExitedExecutorMessage>(&MultiMasterSchedulerProcess::lostExecutor,
       &ExitedExecutorMessage::executor_id, &ExitedExecutorMessage::slave_id,
       &ExitedExecutorMessage::status);
 
-    install<ExecutorToFrameworkMessage>(&SchedulerProcess::frameworkMessage,
+    install<ExecutorToFrameworkMessage>(&MultiMasterSchedulerProcess::frameworkMessage,
       &ExecutorToFrameworkMessage::slave_id,
       &ExecutorToFrameworkMessage::executor_id,
       &ExecutorToFrameworkMessage::data);
 
-    install<FrameworkErrorMessage>(&SchedulerProcess::error,
+    install<FrameworkErrorMessage>(&MultiMasterSchedulerProcess::error,
       &FrameworkErrorMessage::message);
 
-// Start detecting masters.
+    // Start detecting masters.
     detector->detect().onAny(
-      defer(self(), &SchedulerProcess::detected, lambda::_1));
+      defer(self(), &MultiMasterSchedulerProcess::detected, lambda::_1));
   }
 
   void detected(const Future<Option<MasterInfo>>& _master) {
@@ -256,20 +286,34 @@ protected:
       EXIT(EXIT_FAILURE) << "Failed to detect a master: " << _master.failure();
     }
 
-    if (_master->isSome()) {
-      master = _master->get();
-      activeMasters.push_back(master);
-    } else {
-      master = None();
+    if (doesMasterExist(activeMasters, _master->get())) {
+      // We already found this master
+      // Keep on detecting
+      detector->detect(_master.get()).onAny(
+        defer(self(), &MultiMasterSchedulerProcess::detected, lambda::_1));
+      return;
     }
 
+    Option<MasterInfo> newMaster;
+
+    if (_master->isSome()) {
+      // master = _master->get();
+      newMaster = _master->get();
+      activeMasters.push_back(newMaster);
+    } else {
+      // master = None();
+      newMaster = None();
+    }
+
+    /*
+     * Don't disconnect if we find another master
     if (connected) {
-// There are three cases here:
-//   1. The master failed.
-//   2. The master failed over to a new master.
-//   3. The master failed over to the same master.
-// In any case, we will reconnect (possibly immediately), so we
-// must notify schedulers of the disconnection.
+      // There are three cases here:
+      //   1. The master failed.
+      //   2. The master failed over to a new master.
+      //   3. The master failed over to the same master.
+      // In any case, we will reconnect (possibly immediately), so we
+      // must notify schedulers of the disconnection.
       Stopwatch stopwatch;
       if (FLAGS_v >= 1) {
         stopwatch.start();
@@ -279,46 +323,49 @@ protected:
 
       VLOG(1) << "Scheduler::disconnected took " << stopwatch.elapsed();
     }
+    */
 
-    connected = false;
+    // don't mark as disconnected if we find another master
+    // connected = false;
 
-    if (master.isSome()) {
-      LOG(INFO) << "New master detected at " << master->pid();
-      link(master->pid());
+    if (newMaster.isSome()) {
+      LOG(INFO) << "New master detected at " << newMaster->pid();
+      link(newMaster->pid());
 
-// Cancel the pending registration timer to avoid spurious attempts
-// at reregistration. `Clock::cancel` is idempotent, so this call
-// is safe even if no timer is active or pending.
+      // Cancel the pending registration timer to avoid spurious attempts
+      // at reregistration. `Clock::cancel` is idempotent, so this call
+      // is safe even if no timer is active or pending.
       Clock::cancel(frameworkRegistrationTimer);
 
       if (credential.isSome()) {
-// Authenticate with the master.
-// TODO(adam-mesos): Consider adding an initial delay like we do for
-// slave registration, to combat thundering herds on master failover.
-        authenticate();
+        // Authenticate with the master.
+        // TODO(adam-mesos): Consider adding an initial delay like we do for
+        // slave registration, to combat thundering herds on master failover.
+        authenticate(newMaster);
       } else {
-// Proceed with registration without authentication.
+        // Proceed with registration without authentication.
         LOG(INFO) << "No credentials provided."
           << " Attempting to register without authentication";
 
-// TODO(vinod): Similar to the slave add a random delay to the
-// first registration attempt too. This needs fixing tests
-// that expect scheduler to register even with clock paused
-// (e.g., rate limiting tests).
-        doReliableRegistration(flags.registration_backoff_factor);
+        // TODO(vinod): Similar to the slave add a random delay to the
+        // first registration attempt too. This needs fixing tests
+        // that expect scheduler to register even with clock paused
+        // (e.g., rate limiting tests).
+
+        doReliableRegistration(flags.registration_backoff_factor, newMaster);
       }
     } else {
-// In this case, we don't actually invoke Scheduler::error
-// since we might get reconnected to a master imminently.
+      // In this case, we don't actually invoke Scheduler::error
+      // since we might get reconnected to a master imminently.
       LOG(INFO) << "No master detected";
     }
 
-// Keep detecting masters.
+    // Keep detecting masters.
     detector->detect(_master.get()).onAny(
-      defer(self(), &SchedulerProcess::detected, lambda::_1));
+      defer(self(), &MultiMasterSchedulerProcess::detected, lambda::_1));
   }
 
-  void authenticate() {
+  void authenticate(Option<MasterInfo> newMaster) {
     if (!running.load()) {
       VLOG(1) << "Ignoring authenticate because the driver is not running!";
       return;
@@ -326,23 +373,23 @@ protected:
 
     authenticated = false;
 
-    if (master.isNone()) {
+    if (newMaster.isNone()) {
       return;
     }
 
     if (authenticating.isSome()) {
-// Authentication is in progress. Try to cancel it.
-// Note that it is possible that 'authenticating' is ready
-// and the dispatch to '_authenticate' is enqueued when we
-// are here, making the 'discard' here a no-op. This is ok
-// because we set 'reauthenticate' here which enforces a retry
-// in '_authenticate'.
+      // Authentication is in progress. Try to cancel it.
+      // Note that it is possible that 'authenticating' is ready
+      // and the dispatch to '_authenticate' is enqueued when we
+      // are here, making the 'discard' here a no-op. This is ok
+      // because we set 'reauthenticate' here which enforces a retry
+      // in '_authenticate'.
       copy(authenticating.get()).discard();
       reauthenticate = true;
       return;
     }
 
-    LOG(INFO) << "Authenticating with master " << master->pid();
+    LOG(INFO) << "Authenticating with master " << newMaster->pid();
 
     CHECK_SOME(credential);
 
@@ -362,27 +409,27 @@ protected:
       authenticatee = module.get();
     }
 
-// NOTE: We do not pass 'Owned<Authenticatee>' here because doing
-// so could make 'AuthenticateeProcess' responsible for deleting
-// 'Authenticatee' causing a deadlock because the destructor of
-// 'Authenticatee' waits on 'AuthenticateeProcess'.
-// This will happen in the following scenario:
-// --> 'AuthenticateeProcess' does a 'Future.set()'.
-// --> '_authenticate()' is dispatched to this process.
-// --> This process executes '_authenticatee()'.
-// --> 'AuthenticateeProcess' removes the onAny callback
-//     from its queue which holds the last reference to
-//     'Authenticatee'.
-// --> '~Authenticatee()' is invoked by 'AuthenticateeProcess'.
-// TODO(vinod): Consider using 'Shared' to 'Owned' upgrade.
-    authenticating = authenticatee->authenticate(master->pid(), self(),
-      credential.get()).onAny(defer(self(), &Self::_authenticate));
+    // NOTE: We do not pass 'Owned<Authenticatee>' here because doing
+    // so could make 'AuthenticateeProcess' responsible for deleting
+    // 'Authenticatee' causing a deadlock because the destructor of
+    // 'Authenticatee' waits on 'AuthenticateeProcess'.
+    // This will happen in the following scenario:
+    // --> 'AuthenticateeProcess' does a 'Future.set()'.
+    // --> '_authenticate()' is dispatched to this process.
+    // --> This process executes '_authenticatee()'.
+    // --> 'AuthenticateeProcess' removes the onAny callback
+    //     from its queue which holds the last reference to
+    //     'Authenticatee'.
+    // --> '~Authenticatee()' is invoked by 'AuthenticateeProcess'.
+    // TODO(vinod): Consider using 'Shared' to 'Owned' upgrade.
+    authenticating = authenticatee->authenticate(newMaster->pid(), self(),
+      credential.get()).onAny(defer(self(), &Self::_authenticate, newMaster));
 
     delay(flags.authentication_timeout, self(), &Self::authenticationTimeout,
       authenticating.get());
   }
 
-  void _authenticate() {
+  void _authenticate(Option<MasterInfo> newMaster) {
     if (!running.load()) {
       VLOG(1) << "Ignoring _authenticate because the driver is not running!";
       return;
@@ -394,20 +441,20 @@ protected:
     CHECK_SOME(authenticating);
     const Future<bool>& future = authenticating.get();
 
-    if (master.isNone()) {
+    if (newMaster.isNone()) {
       LOG(INFO) << "Ignoring _authenticate because the master is lost";
       authenticating = None();
-// Set it to false because we do not want further retries until
-// a new master is detected.
-// We obviously do not need to reauthenticate either even if
-// 'reauthenticate' is currently true because the master is
-// lost.
+      // Set it to false because we do not want further retries until
+      // a new master is detected.
+      // We obviously do not need to reauthenticate either even if
+      // 'reauthenticate' is currently true because the master is
+      // lost.
       reauthenticate = false;
       return;
     }
 
     if (reauthenticate || !future.isReady()) {
-      LOG(INFO) << "Failed to authenticate with master " << master->pid()
+      LOG(INFO) << "Failed to authenticate with master " << newMaster->pid()
         << ": "
         << (
           reauthenticate ?
@@ -419,39 +466,39 @@ protected:
 
       ++failedAuthentications;
 
-// Backoff.
-// The backoff is a random duration in the interval [0, b * 2^N)
-// where `b = authentication_backoff_factor` and `N` the number
-// of failed authentication attempts. It is capped by
-// `REGISTER_RETRY_INTERVAL_MAX`.
+      // Backoff.
+      // The backoff is a random duration in the interval [0, b * 2^N)
+      // where `b = authentication_backoff_factor` and `N` the number
+      // of failed authentication attempts. It is capped by
+      // `REGISTER_RETRY_INTERVAL_MAX`.
       Duration backoff = flags.authentication_backoff_factor
         * std::pow(2, failedAuthentications);
       backoff = std::min(backoff, scheduler::AUTHENTICATION_RETRY_INTERVAL_MAX);
 
-// Determine the delay for next attempt by picking a random
-// duration between 0 and 'maxBackoff'.
-// TODO(vinod): Use random numbers from <random> header.
+      // Determine the delay for next attempt by picking a random
+      // duration between 0 and 'maxBackoff'.
+      // TODO(vinod): Use random numbers from <random> header.
       backoff *= double(os::random()) / RAND_MAX;
 
-// TODO(vinod): Add a limit on number of retries.
-      delay(backoff, self(), &Self::authenticate);
+      // TODO(vinod): Add a limit on number of retries.
+      delay(backoff, self(), &Self::authenticate, newMaster);
       return;
     }
 
     if (!future.get()) {
-      LOG(ERROR) << "Master " << master->pid() << " refused authentication";
+      LOG(ERROR) << "Master " << newMaster->pid() << " refused authentication";
       error("Master refused authentication");
       return;
     }
 
-    LOG(INFO) << "Successfully authenticated with master " << master->pid();
+    LOG(INFO) << "Successfully authenticated with master " << newMaster->pid();
 
     authenticated = true;
     authenticating = None();
 
     failedAuthentications = 0;
 
-    doReliableRegistration(flags.registration_backoff_factor);
+    doReliableRegistration(flags.registration_backoff_factor, newMaster);
   }
 
   void authenticationTimeout(Future<bool> future) {
@@ -461,17 +508,17 @@ protected:
       return;
     }
 
-// NOTE: Discarded future results in a retry in '_authenticate()'.
-// Also note that a 'discard' here is safe even if another
-// authenticator is in progress because this copy of the future
-// corresponds to the original authenticator that started the timer.
+    // NOTE: Discarded future results in a retry in '_authenticate()'.
+    // Also note that a 'discard' here is safe even if another
+    // authenticator is in progress because this copy of the future
+    // corresponds to the original authenticator that started the timer.
     if (future.discard()) { // This is a no-op if the future is already ready.
       LOG(WARNING) << "Authentication timed out";
     }
   }
 
   void drop(const Event& event, const string& message) {
-// TODO(bmahler): Increment a metric.
+    // TODO(bmahler): Increment a metric.
 
     LOG(WARNING) << "Dropping " << event.type() << ": " << message;
   }
@@ -479,37 +526,49 @@ protected:
   void receive(const UPID& from, const Event& event) {
     switch (event.type()) {
     case Event::SUBSCRIBED: {
+      VLOG(1) << "Received Event::SUBSCRIBED from " << from;
+
       if (!event.has_subscribed()) {
         drop(event, "Expecting 'subscribed' to be present");
         break;
       }
 
-// The scheduler API requires a MasterInfo be passed during
-// (re-)registration, so we rely on the MasterInfo provided
-// by the detector. If it's None, the driver would have
-// dropped the message.
+      // The scheduler API requires a MasterInfo be passed during
+      // (re-)registration, so we rely on the MasterInfo provided
+      // by the detector. If it's None, the driver would have
+      // dropped the message.
+
+      /*
       if (master.isNone()) {
+        drop(event, "No master detected");
+        break;
+      }
+      */
+
+      const Option<MasterInfo> newMaster = doesUPIDExist(activeMasters, from);
+
+      if (newMaster.isNone()) {
         drop(event, "No master detected");
         break;
       }
 
       const FrameworkID& frameworkId = event.subscribed().framework_id();
 
-// Cancel the pending registration timer to avoid spurious attempts
-// at reregistration. `Clock::cancel` is idempotent, so this call
-// is safe even if no timer is active or pending.
+      // Cancel the pending registration timer to avoid spurious attempts
+      // at reregistration. `Clock::cancel` is idempotent, so this call
+      // is safe even if no timer is active or pending.
       Clock::cancel(frameworkRegistrationTimer);
 
-// We match the existing registration semantics of the
-// driver, except for the 3rd case in MESOS-786 (since
-// it requires non-local knowledge and schedulers could
-// not have possibly relied on this case).
+      // We match the existing registration semantics of the
+      // driver, except for the 3rd case in MESOS-786 (since
+      // it requires non-local knowledge and schedulers could
+      // not have possibly relied on this case).
       if (!framework.has_id() || framework.id().value().empty()) {
-        registered(from, frameworkId, master.get());
+        registered(from, frameworkId, newMaster.get());
       } else if (failover) {
-        registered(from, frameworkId, master.get());
+        registered(from, frameworkId, newMaster.get());
       } else {
-        reregistered(from, frameworkId, master.get());
+        reregistered(from, frameworkId, newMaster.get());
       }
 
       break;
@@ -554,8 +613,8 @@ protected:
         break;
       }
 
-// TODO(bmahler): Rename 'rescindOffer' to 'rescind'
-// to match the Event naming scheme.
+      // TODO(bmahler): Rename 'rescindOffer' to 'rescind'
+      // to match the Event naming scheme.
       rescindOffer(from, event.rescind().offer_id());
       break;
     }
@@ -568,7 +627,7 @@ protected:
 
       const TaskStatus& status = event.update().status();
 
-// Create a StatusUpdate based on the TaskStatus.
+      // Create a StatusUpdate based on the TaskStatus.
       StatusUpdate update;
       update.mutable_framework_id()->CopyFrom(framework.id());
       update.mutable_status()->CopyFrom(status);
@@ -586,17 +645,17 @@ protected:
         update.set_uuid(status.uuid());
       }
 
-// Note that we do not need to set the 'pid' now that
-// the driver uses 'uuid' absence to skip acknowledgement.
-//
-// TODO(bmahler): Implement an 'update' method to match
-// the Event naming scheme, and have 'statusUpdate' call
-// into it.
+      // Note that we do not need to set the 'pid' now that
+      // the driver uses 'uuid' absence to skip acknowledgement.
+      //
+      // TODO(bmahler): Implement an 'update' method to match
+      // the Event naming scheme, and have 'statusUpdate' call
+      // into it.
       statusUpdate(from, update, UPID());
       break;
     }
 
-// TODO(greggomann): Implement handling of operation status updates.
+    // TODO(greggomann): Implement handling of operation status updates.
     case Event::UPDATE_OPERATION_STATUS:
       break;
 
@@ -606,8 +665,8 @@ protected:
         break;
       }
 
-// TODO(bmahler): Rename 'frameworkMessage' to 'message'
-// to match the Event naming scheme.
+      // TODO(bmahler): Rename 'frameworkMessage' to 'message'
+      // to match the Event naming scheme.
       frameworkMessage(event.message().slave_id(),
         event.message().executor_id(), event.message().data());
       break;
@@ -619,8 +678,8 @@ protected:
         break;
       }
 
-// TODO(bmahler): Add a 'failure' method and have the
-// lost slave handler call into it.
+      // TODO(bmahler): Add a 'failure' method and have the
+      // lost slave handler call into it.
 
       if (event.failure().has_slave_id() && event.failure().has_executor_id()) {
         CHECK(event.failure().has_status());
@@ -666,13 +725,18 @@ protected:
       return;
     }
 
+    /*
     if (connected) {
       VLOG(1) << "Ignoring framework registered message because "
         << "the driver is already connected!";
       return;
     }
+    */
 
-    if (master.isNone() || !doesMasterExist(activeMasters, master)) {
+    Option<MasterInfo> master = doesUPIDExist(activeMasters, from);
+
+    // master needs to be one we've registered with
+    if (master.isNone()) {
       LOG(WARNING)
         << "Ignoring framework registered message because it was sent "
         << "from '" << from << "' instead of the leading master '"
@@ -682,7 +746,19 @@ protected:
 
     LOG(INFO) << "Framework registered with " << frameworkId;
 
-    framework.mutable_id()->MergeFrom(frameworkId);
+    synchronized (framework_id_mutex) {
+      // if we don't have a framework ID at this point, set one
+      if (!framework.has_id() || framework.id().value().empty()) {
+        framework.mutable_id()->MergeFrom(frameworkId);
+      } else if (frameworkId.value() != framework.id().value()) {
+        // otherwise, another master assigned us a framework ID
+        // send a teardown message to master
+        stopOne(masterInfo, frameworkId);
+        doReliableRegistration(flags.registration_backoff_factor, masterInfo);
+        return;
+      }
+      // framework.mutable_id()->MergeFrom(frameworkId);
+    }
 
     connected = true;
     failover = false;
@@ -692,6 +768,7 @@ protected:
       stopwatch.start();
     }
 
+    Clock::cancel(frameworkRegistrationTimer);
     scheduler->registered(driver, frameworkId, masterInfo);
 
     VLOG(1) << "Scheduler::registered took " << stopwatch.elapsed();
@@ -705,13 +782,17 @@ protected:
       return;
     }
 
+    /*
     if (connected) {
       VLOG(1) << "Ignoring framework reregistered message because "
         << "the driver is already connected!";
       return;
     }
+    */
 
-    if (master.isNone() || !doesMasterExist(activeMasters, master)) {
+    Option<MasterInfo> master = doesUPIDExist(activeMasters, from);
+
+    if (master.isNone()) {
       LOG(WARNING)
         << "Ignoring framework reregistered message because it was sent "
         << "from '" << from << "' instead of the leading master '"
@@ -731,17 +812,18 @@ protected:
       stopwatch.start();
     }
 
+    Clock::cancel(frameworkRegistrationTimer);
     scheduler->reregistered(driver, masterInfo);
 
     VLOG(1) << "Scheduler::reregistered took " << stopwatch.elapsed();
   }
 
-  void doReliableRegistration(Duration maxBackoff) {
+  void doReliableRegistration(Duration maxBackoff, Option<MasterInfo> newMaster) {
     if (!running.load()) {
       return;
     }
 
-    if (connected || master.isNone()) {
+    if (newMaster.isNone()) {
       return;
     }
 
@@ -749,7 +831,7 @@ protected:
       return;
     }
 
-    VLOG(1) << "Sending SUBSCRIBE call to " << master->pid();
+    VLOG(1) << "Sending SUBSCRIBE call to " << newMaster->pid();
 
     Call call;
     call.set_type(Call::SUBSCRIBE);
@@ -757,19 +839,20 @@ protected:
     Call::Subscribe* subscribe = call.mutable_subscribe();
     subscribe->mutable_framework_info()->CopyFrom(framework);
 
+    // set the framework ID if framework already has one
     if (framework.has_id() && !framework.id().value().empty()) {
       subscribe->set_force(failover);
       call.mutable_framework_id()->CopyFrom(framework.id());
     }
 
-    send(master->pid(), call);
+    send(newMaster->pid(), call);
 
-// Bound the maximum backoff by 'REGISTRATION_RETRY_INTERVAL_MAX'.
+    // Bound the maximum backoff by 'REGISTRATION_RETRY_INTERVAL_MAX'.
     maxBackoff = std::min(maxBackoff,
       scheduler::REGISTRATION_RETRY_INTERVAL_MAX);
 
-// If failover timeout is present, bound the maximum backoff
-// by 1/10th of the failover timeout.
+    // If failover timeout is present, bound the maximum backoff
+    // by 1/10th of the failover timeout.
     if (framework.has_failover_timeout()) {
       Try<Duration> duration = Duration::create(framework.failover_timeout());
       if (duration.isSome() && duration.get() > Duration::zero()) {
@@ -777,16 +860,17 @@ protected:
       }
     }
 
-// Determine the delay for next attempt by picking a random
-// duration between 0 and 'maxBackoff'.
-// TODO(vinod): Use random numbers from <random> header.
+    // Determine the delay for next attempt by picking a random
+    // duration between 0 and 'maxBackoff'.
+    // TODO(vinod): Use random numbers from <random> header.
     Duration delay = maxBackoff * ((double) os::random() / RAND_MAX);
 
     VLOG(1) << "Will retry registration in " << delay << " if necessary";
 
-// Backoff.
+    // Backoff.
+
     frameworkRegistrationTimer = process::delay(delay, self(),
-      &Self::doReliableRegistration, maxBackoff * 2);
+      &Self::doReliableRegistration, maxBackoff * 2, newMaster);
   }
 
   void resourceOffers(const UPID& from, const vector<Offer>& offers,
@@ -803,34 +887,48 @@ protected:
       return;
     }
 
-    CHECK_SOME(master);
+    // Make sure there are offers and that the offers were meant for
+    // the current framework_id (in case there was a race to set the id).
+    // If the framework IDs don't match, the offers will be declined during
+    // the teardown phase, and then re-offered soon after.
+    // Offers will always consist of offers from a single master.
+    if (offers.empty() || offers[0].framework_id() != framework.id()) {
+      return;
+    }
 
-    if (!doesMasterExist(activeMasters, master)) {
+    Option<MasterInfo> master = doesUPIDExist(activeMasters, from);
+
+    // CHECK_SOME(master);
+
+    // doesUPIDExist
+    if (master.isNone()) {
       VLOG(1) << "Ignoring resource offers message because it was sent "
         << "from '" << from << "' instead of the leading master '"
         << master->pid() << "'";
       return;
     }
 
-// We exit early if `offers` is empty since we don't implement inverse
-// offers in the old scheduler API. It could be empty when there are only
-// inverse offers as part of the `ResourceOffersMessage`.
+    // We exit early if `offers` is empty since we don't implement inverse
+    // offers in the old scheduler API. It could be empty when there are only
+    // inverse offers as part of the `ResourceOffersMessage`.
     if (offers.empty()) {
       return;
     }
 
-    VLOG(2) << "Received " << offers.size() << " offers";
+    VLOG(2) << "Received " << offers.size() << " offers from " << from;
 
     CHECK_EQ(offers.size(), pids.size());
 
-// Save the pid associated with each slave (one per offer) so
-// later we can send framework messages directly.
+    // Save the pid associated with each slave (one per offer) so
+    // later we can send framework messages directly.
     for (size_t i = 0; i < offers.size(); i++) {
       UPID pid(pids[i]);
-// Check if parse failed (e.g., due to DNS).
+      // Check if parse failed (e.g., due to DNS).
       if (pid != UPID()) {
         VLOG(3) << "Saving PID '" << pids[i] << "'";
-        savedOffers[offers[i].id()][offers[i].slave_id()] = pid;
+        // savedOffers[offers[i].id()][offers[i].slave_id()] = pid;
+        savedOffers[offers[i].id()].slaveMap[offers[i].slave_id()] = pid;
+        savedOffers[offers[i].id()].master = from;
       } else {
         VLOG(1) << "Failed to parse PID '" << pids[i] << "'";
       }
@@ -859,9 +957,10 @@ protected:
       return;
     }
 
-    CHECK_SOME(master);
+    Option<MasterInfo> master = doesUPIDExist(activeMasters, from);
+    // CHECK_SOME(master);
 
-    if (!doesMasterExist(activeMasters, master)) {
+    if (master.isNone()) {
       VLOG(1) << "Ignoring rescind offer message because it was sent "
         << "from '" << from << "' instead of the leading master '"
         << master->pid() << "'";
@@ -890,7 +989,9 @@ protected:
       return;
     }
 
-// Allow status updates created from the driver itself.
+    Option<MasterInfo> master = doesUPIDExist(activeMasters, from);
+
+    // Allow status updates created from the driver itself.
     if (from != UPID()) {
       if (!connected) {
         VLOG(1) << "Ignoring status update message because the driver is "
@@ -898,9 +999,9 @@ protected:
         return;
       }
 
-      CHECK_SOME(master);
+      //CHECK_SOME(master);
 
-      if (!doesMasterExist(activeMasters, master)) {
+      if (master.isNone()) {
         VLOG(1) << "Ignoring status update message because it was sent "
           << "from '" << from << "' instead of the leading master '"
           << master->pid() << "'";
@@ -908,30 +1009,33 @@ protected:
       }
     }
 
+    // CHECK(framework.id() == update.framework_id());
+    if (framework.id() != update.framework_id()) {
+      VLOG(1) << "Received status update " << update << " for wrong framework";
+      return;
+    }
+
     VLOG(2) << "Received status update " << update << " from " << pid;
-
-    CHECK(framework.id() == update.framework_id());
-
-// TODO(benh): Note that this maybe a duplicate status update!
-// Once we get support to try and have a more consistent view
-// of what's running in the cluster, we'll just let this one
-// slide. The alternative is possibly dealing with a scheduler
-// failover and not correctly giving the scheduler it's status
-// update, which seems worse than giving a status update
-// multiple times (of course, if a scheduler re-uses a TaskID,
-// that could be bad.
+    // TODO(benh): Note that this maybe a duplicate status update!
+    // Once we get support to try and have a more consistent view
+    // of what's running in the cluster, we'll just let this one
+    // slide. The alternative is possibly dealing with a scheduler
+    // failover and not correctly giving the scheduler it's status
+    // update, which seems worse than giving a status update
+    // multiple times (of course, if a scheduler re-uses a TaskID,
+    // that could be bad.
 
     TaskStatus status = update.status();
 
-// If the update does not have a 'uuid', it does not need
-// acknowledging. However, prior to 0.23.0, the update uuid
-// was required and always set. In 0.24.0, we can rely on the
-// update uuid check here, until then we must still check for
-// this being sent from the driver (from == UPID()) or from
-// the master (pid == UPID()).
-//
-// TODO(vinod): Get rid of this logic in 0.27.0 because master
-// correctly sets task status since 0.26.0.
+    // If the update does not have a 'uuid', it does not need
+    // acknowledging. However, prior to 0.23.0, the update uuid
+    // was required and always set. In 0.24.0, we can rely on the
+    // update uuid check here, until then we must still check for
+    // this being sent from the driver (from == UPID()) or from
+    // the master (pid == UPID()).
+    //
+    // TODO(vinod): Get rid of this logic in 0.27.0 because master
+    // correctly sets task status since 0.26.0.
     if (!update.has_uuid() || update.uuid() == "") {
       status.clear_uuid();
     } else if (from == UPID() || pid == UPID()) {
@@ -950,19 +1054,19 @@ protected:
     VLOG(1) << "Scheduler::statusUpdate took " << stopwatch.elapsed();
 
     if (implicitAcknowledgements) {
-// Note that we need to look at the atomic 'running' here
-// so that we don't acknowledge the update if the driver was
-// aborted during the processing of the update.
+      // Note that we need to look at the atomic 'running' here
+      // so that we don't acknowledge the update if the driver was
+      // aborted during the processing of the update.
       if (!running.load()) {
         VLOG(1) << "Not sending status update acknowledgment message because "
           << "the driver is not running!";
         return;
       }
 
-// See above for when we don't need to acknowledge.
+      // See above for when we don't need to acknowledge.
       if ((update.has_uuid() && update.uuid() != "")
         || (from != UPID() && pid != UPID())) {
-// We drop updates while we're disconnected.
+        // We drop updates while we're disconnected.
         CHECK(connected);
         CHECK_SOME(master);
 
@@ -999,9 +1103,10 @@ protected:
       return;
     }
 
+    Option<MasterInfo> master = doesUPIDExist(activeMasters, from);
     CHECK_SOME(master);
 
-    if (!doesMasterExist(activeMasters, master)) {
+    if (master.isNone()) {
       VLOG(1) << "Ignoring lost agent message because it was sent " << "from '"
         << from << "' instead of the leading master '" << master->pid() << "'";
       return;
@@ -1035,8 +1140,9 @@ protected:
       return;
     }
 
+    Option<MasterInfo> master = doesUPIDExist(activeMasters, from);
     CHECK_SOME(master);
-    if (!doesMasterExist(activeMasters, master)) {
+    if (master.isNone()) {
       VLOG(1) << "Ignoring lost executor message because it was sent "
         << "from '" << from << "' instead of the leading master '"
         << master->pid() << "'";
@@ -1099,8 +1205,8 @@ protected:
   void stop(bool failover) {
     LOG(INFO) << "Stopping framework " << framework.id();
 
-// Whether or not we send an unregister message, we want to
-// terminate this process.
+  // Whether or not we send an unregister message, we want to
+  // terminate this process.
     terminate(self());
 
     if (connected && !failover) {
@@ -1110,13 +1216,33 @@ protected:
       call.mutable_framework_id()->CopyFrom(framework.id());
       call.set_type(Call::TEARDOWN);
 
-      CHECK_SOME(master);
-      send(master->pid(), call);
+      // CHECK_SOME(master);
+
+      // unregister from all active masters
+      for (auto const& m : activeMasters) {
+        if (m.isSome()) {
+          send(m->pid(), call);
+        }
+      }
     }
 
     synchronized (mutex){
-    CHECK_NOTNULL(latch)->trigger();
-  }
+      CHECK_NOTNULL(latch)->trigger();
+    }
+}
+
+void stopOne(const MasterInfo& masterInfo, const FrameworkID& frameworkID) {
+  // Tell a particular master to teardown a framework
+  // convenient because we're talking to multiple masters at a time;
+  // can kill one connection without shutting down entire framework.
+  Call call;
+
+  CHECK(framework.has_id());
+  call.mutable_framework_id()->CopyFrom(frameworkID);
+  call.set_type(Call::TEARDOWN);
+
+  // unregister from all active masters
+  send(masterInfo.pid(), call);
 }
 
 // NOTE: This function informs the master to stop attempting to send
@@ -1136,8 +1262,15 @@ void abort()
   } else {
     DeactivateFrameworkMessage message;
     message.mutable_framework_id()->MergeFrom(framework.id());
-    CHECK_SOME(master);
-    send(master->pid(), message);
+    // CHECK_SOME(master);
+    // send(master->pid(), message);
+
+    // unregister from all active masters
+    for (auto const& m : activeMasters) {
+      if (m.isSome()) {
+        send(m->pid(), message);
+      }
+    }
   }
 
   synchronized (mutex) {
@@ -1161,8 +1294,16 @@ void killTask(const TaskID& taskId)
   Call::Kill* kill = call.mutable_kill();
   kill->mutable_task_id()->CopyFrom(taskId);
 
-  CHECK_SOME(master);
-  send(master->pid(), call);
+  //CHECK_SOME(master);
+  // TODO(erin): send this to right master
+  // unregister from all active masters
+  for (auto const& m : activeMasters) {
+    if (m.isSome()) {
+      send(m->pid(), call);
+    }
+  }
+
+  //send(master->pid(), call);
 }
 
 void requestResources(const vector<Request>& requests)
@@ -1183,8 +1324,14 @@ void requestResources(const vector<Request>& requests)
     request->add_requests()->CopyFrom(_request);
   }
 
-  CHECK_SOME(master);
-  send(master->pid(), call);
+  //CHECK_SOME(master);
+  // TODO(erin): ask all or subset for resource
+  // send(master->pid(), call);
+  for (auto const& m : activeMasters) {
+    if (m.isSome()) {
+      send(m->pid(), call);
+    }
+  }
 }
 
 void launchTasks(const vector<OfferID>& offerIds,
@@ -1196,26 +1343,49 @@ void launchTasks(const vector<OfferID>& offerIds,
 
   Offer::Operation::Launch* launch = operation.mutable_launch();
   foreach (const TaskInfo& task, tasks) {
+    // add task info to each launch operation
     launch->add_task_infos()->CopyFrom(task);
   }
 
   acceptOffers(offerIds, {operation}, filters);
 }
 
+
 void acceptOffers(
   const vector<OfferID>& offerIds,
   const vector<Offer::Operation>& operations,
   const Filters& filters)
 {
-// TODO(jieyu): Move all driver side verification to master since
-// we are moving towards supporting pure launguage scheduler.
+  hashmap<UPID, vector<OfferID>> offersFromMasters;
+
+  foreach (const OfferID& offerID, offerIds) {
+    if (savedOffers.contains(offerID)) {
+      offersFromMasters[savedOffers[offerID].master].push_back(offerID);
+    }
+  }
+
+  // accept offers from each master
+  for (const auto &pair : offersFromMasters) {
+      acceptOffers(pair.second, operations, filters, pair.first);
+  }
+}
+
+
+void acceptOffers(
+  const vector<OfferID>& offerIds,
+  const vector<Offer::Operation>& operations,
+  const Filters& filters,
+  const UPID& sender)
+{
+  // TODO(jieyu): Move all driver side verification to master since
+  // we are moving towards supporting pure launguage scheduler.
 
   if (!connected) {
     VLOG(1) << "Ignoring accept offers message as master is disconnected";
 
-// Reply to the framework with TASK_DROPPED messages for each
-// task launch. If the framework is not partition-aware, we send
-// TASK_LOST instead. See details from notes in `launchTasks`.
+    // Reply to the framework with TASK_DROPPED messages for each
+    // task launch. If the framework is not partition-aware, we send
+    // TASK_LOST instead. See details from notes in `launchTasks`.
     TaskState newTaskState = TASK_DROPPED;
     if (!protobuf::frameworkHasCapability(
         framework, FrameworkInfo::Capability::PARTITION_AWARE)) {
@@ -1245,13 +1415,21 @@ void acceptOffers(
   }
 
   Call call;
+
+  // make sure framework has an id
   CHECK(framework.has_id());
+
+  // set framework_id on acceptance call so master knows
+  // which framework accepted an offer
   call.mutable_framework_id()->CopyFrom(framework.id());
+
+  // set type of call to ACCEPT
   call.set_type(Call::ACCEPT);
 
+  // get a mutable version of protobuf accept message
   Call::Accept* accept = call.mutable_accept();
 
-// Setting accept.operations.
+  // Setting accept.operations.
   foreach (const Offer::Operation& _operation, operations) {
     if (_operation.has_id()) {
       ABORT("An offer operation's 'id' field was set, which is disallowed"
@@ -1263,19 +1441,21 @@ void acceptOffers(
     operation->CopyFrom(_operation);
   }
 
-// Setting accept.offer_ids.
+  // Setting accept.offer_ids.
   foreach (const OfferID& offerId, offerIds) {
     accept->add_offer_ids()->CopyFrom(offerId);
 
+    // offer isn't in list of saved offers
     if (!savedOffers.contains(offerId)) {
-// TODO(jieyu): A duplicated offer ID could also cause this
-// warning being printed. Consider refine this message here
-// and in launchTasks as well.
+      // TODO(jieyu): A duplicated offer ID could also cause this
+      // warning being printed. Consider refine this message here
+      // and in launchTasks as well.
       LOG(WARNING) << "Attempting to accept an unknown offer " << offerId;
     } else {
-// Keep only the slave PIDs where we run tasks so we can send
-// framework messages directly.
+      // Keep only the slave PIDs where we run tasks so we can send
+      // framework messages directly.
       foreach (const Offer::Operation& operation, operations) {
+        // launch tasks in response to offers
         if (operation.type() != Offer::Operation::LAUNCH) {
           continue;
         }
@@ -1283,8 +1463,8 @@ void acceptOffers(
         foreach (const TaskInfo& task, operation.launch().task_infos()) {
           const SlaveID& slaveId = task.slave_id();
 
-          if (savedOffers[offerId].contains(slaveId)) {
-            savedSlavePids[slaveId] = savedOffers[offerId][slaveId];
+          if (savedOffers[offerId].slaveMap.contains(slaveId)) {
+            savedSlavePids[slaveId] = savedOffers[offerId].slaveMap[slaveId];
           } else {
             LOG(WARNING) << "Attempting to launch task " << task.task_id()
             << " with the wrong agent id " << slaveId;
@@ -1293,15 +1473,16 @@ void acceptOffers(
       }
     }
 
-// Remove the offer since we saved all the PIDs we might use.
+    // Remove the offer since we saved all the PIDs we might use.
     savedOffers.erase(offerId);
   }
 
-// Setting accept.filters.
+  // Setting accept.filters.
   accept->mutable_filters()->CopyFrom(filters);
 
-  CHECK_SOME(master);
-  send(master->pid(), call);
+  //CHECK_SOME(master);
+  // TODO(erin): figure out which master?
+  send(sender, call);
 }
 
 void declineOffer(
@@ -1313,12 +1494,16 @@ void declineOffer(
     return;
   }
 
+  UPID sender;
+
   if (!savedOffers.contains(offerId)) {
     LOG(WARNING) << "Attempting to decline an unknown offer " << offerId;
+  } else {
+    sender = savedOffers[offerId].master;
   }
 
-// Remove the offer. We do not need to save any PIDs
-// when declining an offer.
+  // Remove the offer. We do not need to save any PIDs
+  // when declining an offer.
   savedOffers.erase(offerId);
 
   Call call;
@@ -1331,8 +1516,9 @@ void declineOffer(
   decline->add_offer_ids()->CopyFrom(offerId);
   decline->mutable_filters()->CopyFrom(filters);
 
-  CHECK_SOME(master);
-  send(master->pid(), call);
+  // CHECK_SOME(sender);
+  // TODO(erin): figure out which offer
+  send(sender, call);
 }
 
 void reviveOffers()
@@ -1348,8 +1534,14 @@ void reviveOffers()
   call.mutable_framework_id()->CopyFrom(framework.id());
   call.set_type(Call::REVIVE);
 
-  CHECK_SOME(master);
-  send(master->pid(), call);
+  // CHECK_SOME(master);
+  // TODO(erin): figure out which offer
+  for (auto const& m : activeMasters) {
+    if (m.isSome()) {
+      send(m->pid(), call);
+    }
+  }
+  //send(master->pid(), call);
 }
 
 void suppressOffers()
@@ -1365,16 +1557,23 @@ void suppressOffers()
   call.mutable_framework_id()->CopyFrom(framework.id());
   call.set_type(Call::SUPPRESS);
 
-  CHECK_SOME(master);
-  send(master->pid(), call);
+  // CHECK_SOME(master);
+  // TODO(erin): figure out which offer
+  // send(master->pid(), call);
+
+  for (auto const& m : activeMasters) {
+    if (m.isSome()) {
+      send(m->pid(), call);
+    }
+  }
 }
 
 void acknowledgeStatusUpdate(
   const TaskStatus& status)
 {
-// The driver should abort before allowing an acknowledgement
-// call when implicit acknowledgements are enabled. We further
-// enforce that the driver is denying the call through this CHECK.
+  // The driver should abort before allowing an acknowledgement
+  // call when implicit acknowledgements are enabled. We further
+  // enforce that the driver is denying the call through this CHECK.
   CHECK(!implicitAcknowledgements);
 
   if (!connected) {
@@ -1383,23 +1582,24 @@ void acknowledgeStatusUpdate(
     return;
   }
 
-// NOTE: By ignoring the atomic 'running' here, we ensure that all
-// acknowledgements requested before the driver was stopped or
-// aborted are processed. Any acknowledgement that is requested
-// after the driver stops or aborts (running.load() == false) will
-// be dropped in the driver before reaching here.
+  // NOTE: By ignoring the atomic 'running' here, we ensure that all
+  // acknowledgements requested before the driver was stopped or
+  // aborted are processed. Any acknowledgement that is requested
+  // after the driver stops or aborts (running.load() == false) will
+  // be dropped in the driver before reaching here.
 
-// Only statuses with a 'uuid' and a 'slave_id' need to have
-// acknowledgements sent to the master. Note that the driver
-// ensures that master-generated and driver-generated updates
-// will not have a 'uuid' set.
+  // Only statuses with a 'uuid' and a 'slave_id' need to have
+  // acknowledgements sent to the master. Note that the driver
+  // ensures that master-generated and driver-generated updates
+  // will not have a 'uuid' set.
   if (status.has_uuid() && status.has_slave_id()) {
-    CHECK_SOME(master);
+    // CHECK_SOME(master);
+    // const TaskID taskID = status.task_id();
 
     VLOG(2) << "Sending ACK for status update " << status.uuid()
     << " of task " << status.task_id()
-    << " on agent " << status.slave_id()
-    << " to " << master->pid();
+    << " on agent " << status.slave_id();
+    // << " to " << master->pid();
 
     Call call;
 
@@ -1412,7 +1612,14 @@ void acknowledgeStatusUpdate(
     acknowledge->mutable_task_id()->CopyFrom(status.task_id());
     acknowledge->set_uuid(status.uuid());
 
-    send(master->pid(), call);
+    // TODO(erin): which master
+    for (auto const& m : activeMasters) {
+      if (m.isSome()) {
+        send(m->pid(), call);
+      }
+    }
+
+    // send(master->pid(), call);
   } else {
     VLOG(2) << "Received ACK for status update"
     << (status.has_uuid() ? " " + status.uuid() : "")
@@ -1434,18 +1641,18 @@ void sendFrameworkMessage(const ExecutorID& executorId,
   VLOG(2) << "Asked to send framework message to agent "
   << slaveId;
 
-// TODO(benh): After a scheduler has reregistered it won't have
-// any saved slave PIDs, maybe it makes sense to try and save each
-// PID that this scheduler tries to send a message to? Or we can
-// just wait for them to recollect as new offers come in and get
-// accepted.
+  // TODO(benh): After a scheduler has reregistered it won't have
+  // any saved slave PIDs, maybe it makes sense to try and save each
+  // PID that this scheduler tries to send a message to? Or we can
+  // just wait for them to recollect as new offers come in and get
+  // accepted.
 
   if (savedSlavePids.count(slaveId) > 0) {
     UPID slave = savedSlavePids[slaveId];
     CHECK(slave != UPID());
 
-// TODO(vinod): Send a Call directly to the slave once that
-// support is added.
+    // TODO(vinod): Send a Call directly to the slave once that
+    // support is added.
     FrameworkToExecutorMessage message;
     message.mutable_slave_id()->MergeFrom(slaveId);
     message.mutable_framework_id()->MergeFrom(framework.id());
@@ -1467,8 +1674,15 @@ void sendFrameworkMessage(const ExecutorID& executorId,
     message->mutable_executor_id()->CopyFrom(executorId);
     message->set_data(data);
 
-    CHECK_SOME(master);
-    send(master->pid(), call);
+    // CHECK_SOME(master);
+    // TODO(erin): which master
+    for (auto const& m : activeMasters) {
+      if (m.isSome()) {
+        send(m->pid(), call);
+      }
+    }
+
+    // send(master->pid(), call);
   }
 }
 
@@ -1495,28 +1709,35 @@ void reconcileTasks(const vector<TaskStatus>& statuses)
     }
   }
 
-  CHECK_SOME(master);
-  send(master->pid(), call);
+  // TODO(erin): which master
+  // CHECK_SOME(master);
+  for (auto const& m : activeMasters) {
+    if (m.isSome()) {
+      send(m->pid(), call);
+    }
+  }
+
+  // send(master->pid(), call);
 }
 
 private:
-friend class mesos::MesosSchedulerDriver;
+friend class mesos::MultiMesosSchedulerDriver;
 
 struct Metrics
 {
-  Metrics(const SchedulerProcess& schedulerProcess)
+  Metrics(const MultiMasterSchedulerProcess& schedulerProcess)
   : event_queue_messages(
     "scheduler/event_queue_messages",
-    defer(schedulerProcess, &SchedulerProcess::_event_queue_messages)),
+    defer(schedulerProcess, &MultiMasterSchedulerProcess::_event_queue_messages)),
   event_queue_dispatches(
     "scheduler/event_queue_dispatches",
     defer(schedulerProcess,
-      &SchedulerProcess::_event_queue_dispatches))
+      &MultiMasterSchedulerProcess::_event_queue_dispatches))
   {
-// TODO(dhamon): When we start checking the return value of 'add' we may
-// get failures in situations where multiple SchedulerProcesses are active
-// (ie, the fault tolerance tests). At that point we'll need MESOS-1285 to
-// be fixed and to use self().id in the metric name.
+    // TODO(dhamon): When we start checking the return value of 'add' we may
+    // get failures in situations where multiple SchedulerProcesses are active
+    // (ie, the fault tolerance tests). At that point we'll need MESOS-1285 to
+    // be fixed and to use self().id in the metric name.
     process::metrics::add(event_queue_messages);
     process::metrics::add(event_queue_dispatches);
   }
@@ -1527,10 +1748,10 @@ struct Metrics
     process::metrics::remove(event_queue_dispatches);
   }
 
-// Process metrics.
+  // Process metrics.
   process::metrics::PullGauge event_queue_messages;
   process::metrics::PullGauge event_queue_dispatches;
-}metrics;
+} metrics;
 
 double _event_queue_messages()
 {
@@ -1542,16 +1763,17 @@ double _event_queue_dispatches()
   return static_cast<double>(eventCount<DispatchEvent>());
 }
 
-MesosSchedulerDriver* driver;
+MultiMesosSchedulerDriver* driver;
 Scheduler* scheduler;
 FrameworkInfo framework;
 std::recursive_mutex* mutex;
+std::mutex framework_id_mutex;
 Latch* latch;
 std::vector<Option<MasterInfo>> activeMasters;
 
 bool failover;
 
-Option<MasterInfo> master;
+// Option<MasterInfo> master;
 
 bool connected; // Flag to indicate if framework is registered.
 
@@ -1572,7 +1794,7 @@ const internal::scheduler::Flags flags;
 // Timer for triggering registration of the framework with the master.
 process::Timer frameworkRegistrationTimer;
 
-hashmap<OfferID, hashmap<SlaveID, UPID>> savedOffers;
+hashmap<OfferID, OfferInfo> savedOffers;
 hashmap<SlaveID, UPID> savedSlavePids;
 
 // The driver optionally provides implicit acknowledgements
@@ -1602,107 +1824,106 @@ uint64_t failedAuthentications;
 } // namespace internal {
 } // namespace mesos {
 
-class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
-  void initialize() {
-    GOOGLE_PROTOBUF_VERIFY_VERSION;
+void MultiMesosSchedulerDriver::initialize() {
+  GOOGLE_PROTOBUF_VERIFY_VERSION;
 
-    // Load any flags from the environment (we use local::Flags in the
-    // event we run in 'local' mode, since it inherits logging::Flags).
-    // In the future, just as the TODO in local/main.cpp discusses,
-    // we'll probably want a way to load master::Flags and slave::Flags
-    // as well.
-    local::Flags flags;
-    Try<flags::Warnings> load = flags.load("MESOS_");
+  // Load any flags from the environment (we use local::Flags in the
+  // event we run in 'local' mode, since it inherits logging::Flags).
+  // In the future, just as the TODO in local/main.cpp discusses,
+  // we'll probably want a way to load master::Flags and slave::Flags
+  // as well.
+  local::Flags flags;
+  Try<flags::Warnings> load = flags.load("MESOS_");
 
-    if (load.isError()) {
-      status = DRIVER_ABORTED;
-      scheduler->error(this, load.error());
-      return;
-    }
-
-    // Initialize libprocess. NOTE: We need to ensure this happens
-    // before we invoke anything in libprocess. While libprocess will
-    // call `process::initialize` internally if needed, it will do so
-    // without passing any parameters; any subsequent calls to
-    // `process::initialize` (with non-empty arguments) will be ignored.
-    process::initialize(schedulerId);
-
-    if (process::address().ip.isLoopback()) {
-      LOG(WARNING) << "\n**************************************************\n"
-      << "Scheduler driver bound to loopback interface!"
-      << " Cannot communicate with remote master(s)."
-      << " You might want to set 'LIBPROCESS_IP' environment"
-      << " variable to use a routable IP address.\n"
-      << "**************************************************";
-    }
-
-    // Initialize logging.
-    // TODO(benh): Replace whitespace in framework.name() with '_'?
-    if (flags.initialize_driver_logging) {
-      logging::initialize(framework.name(), false, flags);
-    } else {
-      VLOG(1) << "Disabling initialization of GLOG logging";
-    }
-
-    // Log any flag warnings (after logging is initialized).
-    foreach (const flags::Warning& warning, load->warnings) {
-      LOG(WARNING) << warning.message;
-    }
-
-    spawn(new VersionProcess(), true);
-
-    // Initialize Latch.
-    latch = new Latch();
-
-    // TODO(benh): Check the user the framework wants to run tasks as,
-    // see if the current user can switch to that user, or via an
-    // authentication module ensure this is acceptable.
-
-    // See FrameWorkInfo in include/mesos/mesos.proto:
-    if (framework.user().empty()) {
-      Result<string> user = os::user();
-      CHECK_SOME(user);
-
-      framework.set_user(user.get());
-    }
-
-    if (framework.hostname().empty()) {
-      Try<string> hostname = net::hostname();
-      if (hostname.isSome()) {
-        framework.set_hostname(hostname.get());
-      }
-    }
-
-    // Launch a local cluster if necessary.
-    Option<UPID> pid;
-    if (master == "local") {
-      pid = local::launch(flags);
-    }
-
-    CHECK(process == nullptr);
-
-    url = pid.isSome() ? static_cast<string>(pid.get()) : master;
+  if (load.isError()) {
+    status = DRIVER_ABORTED;
+    scheduler->error(this, load.error());
+    return;
   }
 
-  // Implementation of C++ API.
-  //
-  // Notes:
-  //
-  // (1) Callbacks should be serialized as well as calls into the
-  //     class. We do the former because the message reads from
-  //     SchedulerProcess are serialized. We do the latter currently by
-  //     using locks for certain methods ... but this may change in the
-  //     future.
-  //
-  // (2) There is a variable called state, that represents the current
-  //     state of the driver and is used to enforce its state transitions.
-  // TODO(vinod): Deprecate this in favor of the constructor that takes
-  // the credential.
-  MultiMesosSchedulerDriver(
-  Scheduler* _scheduler,
-  const FrameworkInfo& _framework,
-  const string& _master)
-  : detector(nullptr),
+  // Initialize libprocess. NOTE: We need to ensure this happens
+  // before we invoke anything in libprocess. While libprocess will
+  // call `process::initialize` internally if needed, it will do so
+  // without passing any parameters; any subsequent calls to
+  // `process::initialize` (with non-empty arguments) will be ignored.
+  process::initialize(schedulerId);
+
+  if (process::address().ip.isLoopback()) {
+    LOG(WARNING) << "\n**************************************************\n"
+    << "Scheduler driver bound to loopback interface!"
+    << " Cannot communicate with remote master(s)."
+    << " You might want to set 'LIBPROCESS_IP' environment"
+    << " variable to use a routable IP address.\n"
+    << "**************************************************";
+  }
+
+  // Initialize logging.
+  // TODO(benh): Replace whitespace in framework.name() with '_'?
+  if (flags.initialize_driver_logging) {
+    logging::initialize(framework.name(), false, flags);
+  } else {
+    VLOG(1) << "Disabling initialization of GLOG logging";
+  }
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
+
+  spawn(new VersionProcess(), true);
+
+  // Initialize Latch.
+  latch = new Latch();
+
+  // TODO(benh): Check the user the framework wants to run tasks as,
+  // see if the current user can switch to that user, or via an
+  // authentication module ensure this is acceptable.
+
+  // See FrameWorkInfo in include/mesos/mesos.proto:
+  if (framework.user().empty()) {
+    Result<string> user = os::user();
+    CHECK_SOME(user);
+
+    framework.set_user(user.get());
+  }
+
+  if (framework.hostname().empty()) {
+    Try<string> hostname = net::hostname();
+    if (hostname.isSome()) {
+      framework.set_hostname(hostname.get());
+    }
+  }
+
+  // Launch a local cluster if necessary.
+  Option<UPID> pid;
+  if (master == "local") {
+    pid = local::launch(flags);
+  }
+
+  CHECK(process == nullptr);
+
+  url = pid.isSome() ? static_cast<string>(pid.get()) : master;
+}
+
+// Implementation of C++ API.
+//
+// Notes:
+//
+// (1) Callbacks should be serialized as well as calls into the
+//     class. We do the former because the message reads from
+//     SchedulerProcess are serialized. We do the latter currently by
+//     using locks for certain methods ... but this may change in the
+//     future.
+//
+// (2) There is a variable called state, that represents the current
+//     state of the driver and is used to enforce its state transitions.
+// TODO(vinod): Deprecate this in favor of the constructor that takes
+// the credential.
+MultiMesosSchedulerDriver::MultiMesosSchedulerDriver(
+Scheduler* _scheduler,
+const FrameworkInfo& _framework,
+const string& _master):
+  detector(nullptr),
   scheduler(_scheduler),
   framework(_framework),
   master(_master),
@@ -1712,35 +1933,35 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
   implicitAcknowlegements(true),
   credential(nullptr),
   schedulerId("scheduler-" + id::UUID::random().toString())
-  {
+{
   initialize();
-  }
+}
 
-  MultiMesosSchedulerDriver(
+MultiMesosSchedulerDriver::MultiMesosSchedulerDriver(
   Scheduler* _scheduler,
   const FrameworkInfo& _framework,
   const string& _master,
-  const Credential& _credential)
-  : detector(nullptr),
-  scheduler(_scheduler),
-  framework(_framework),
-  master(_master),
-  process(nullptr),
-  latch(nullptr),
-  status(DRIVER_NOT_STARTED),
-  implicitAcknowlegements(true),
-  credential(new Credential(_credential)),
-  schedulerId("scheduler-" + id::UUID::random().toString())
-  {
+  const Credential& _credential):
+    detector(nullptr),
+    scheduler(_scheduler),
+    framework(_framework),
+    master(_master),
+    process(nullptr),
+    latch(nullptr),
+    status(DRIVER_NOT_STARTED),
+    implicitAcknowlegements(true),
+    credential(new Credential(_credential)),
+    schedulerId("scheduler-" + id::UUID::random().toString())
+{
   initialize();
-  }
+}
 
-  MultiMesosSchedulerDriver(
-  Scheduler* _scheduler,
-  const FrameworkInfo& _framework,
-  const string& _master,
-  bool _implicitAcknowlegements)
-  : detector(nullptr),
+MultiMesosSchedulerDriver::MultiMesosSchedulerDriver(
+Scheduler* _scheduler,
+const FrameworkInfo& _framework,
+const string& _master,
+bool _implicitAcknowlegements):
+  detector(nullptr),
   scheduler(_scheduler),
   framework(_framework),
   master(_master),
@@ -1750,17 +1971,17 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
   implicitAcknowlegements(_implicitAcknowlegements),
   credential(nullptr),
   schedulerId("scheduler-" + id::UUID::random().toString())
-  {
+{
   initialize();
-  }
+}
 
-  MultiMesosSchedulerDriver(
+MultiMesosSchedulerDriver::MultiMesosSchedulerDriver(
   Scheduler* _scheduler,
   const FrameworkInfo& _framework,
   const string& _master,
   bool _implicitAcknowlegements,
-  const Credential& _credential)
-  : detector(nullptr),
+  const Credential& _credential):
+  detector(nullptr),
   scheduler(_scheduler),
   framework(_framework),
   master(_master),
@@ -1770,12 +1991,12 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
   implicitAcknowlegements(_implicitAcknowlegements),
   credential(new Credential(_credential)),
   schedulerId("scheduler-" + id::UUID::random().toString())
-  {
+{
   initialize();
-  }
+}
 
-  ~MultiMesosSchedulerDriver()
-  {
+MultiMesosSchedulerDriver::~MultiMesosSchedulerDriver()
+{
   // We want to make sure the SchedulerProcess has completed so it
   // doesn't try to make calls into us after we are gone. There is an
   // unfortunate deadlock scenario that occurs when we try and wait
@@ -1792,9 +2013,9 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
   // debug output for the case where we wait indefinitely due to
   // deadlock.
   if (process != nullptr) {
-  // We call 'terminate()' here to ensure that SchedulerProcess
-  // terminates even if the user forgot to call stop/abort on the
-  // driver.
+    // We call 'terminate()' here to ensure that SchedulerProcess
+    // terminates even if the user forgot to call stop/abort on the
+    // driver.
     terminate(process);
     wait(process);
   }
@@ -1809,16 +2030,16 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
   if (master == "local" || master == "localquiet") {
     local::shutdown();
   }
-  }
+}
 
-  Status start()
-  {
+Status MultiMesosSchedulerDriver::start()
+{
   synchronized (mutex) {
     if (status != DRIVER_NOT_STARTED) {
       return status;
     }
 
-  // Load scheduler flags.
+    // Load scheduler flags.
     internal::scheduler::Flags flags;
     Try<flags::Warnings> load = flags.load("MESOS_");
 
@@ -1828,13 +2049,13 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
       return status;
     }
 
-  // Log any flag warnings.
+    // Log any flag warnings.
     foreach (const flags::Warning& warning, load->warnings) {
       LOG(WARNING) << warning.message;
     }
 
-  // Initialize modules. Note that since other subsystems may depend
-  // upon modules, we should initialize modules before anything else.
+    // Initialize modules. Note that since other subsystems may depend
+    // upon modules, we should initialize modules before anything else.
     if (flags.modules.isSome() && flags.modulesDir.isSome()) {
       status = DRIVER_ABORTED;
       scheduler->error(
@@ -1853,7 +2074,7 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
       }
     }
 
-  // load in modules
+    // load in modules
     if (flags.modules.isSome()) {
       Try<Nothing> result = modules::ModuleManager::load(flags.modules.get());
       if (result.isError()) {
@@ -1863,7 +2084,7 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
       }
     }
 
-  // create detector if one doesn't exist
+    // create detector if one doesn't exist
     if (detector == nullptr) {
       Try<shared_ptr<MasterDetector>> detector_ =
       DetectorPool::get(url, flags.master_detector);
@@ -1876,7 +2097,7 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
         return status;
       }
 
-  // Save the detector so we can delete it later.
+      // Save the detector so we can delete it later.
       detector = detector_.get();
     }
 
@@ -1913,26 +2134,26 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
 
     return status = DRIVER_RUNNING;
   }
-  }
+}
 
-  Status stop(bool failover)
-  {
-    synchronized (mutex) {
-      LOG(INFO) << "Asked to stop the driver";
+Status MultiMesosSchedulerDriver::stop(bool failover)
+{
+  synchronized (mutex) {
+    LOG(INFO) << "Asked to stop the driver";
 
-      if (status != DRIVER_RUNNING && status != DRIVER_ABORTED) {
-        VLOG(1) << "Ignoring stop because the status of the driver is "
-        << Status_Name(status);
-        return status;
-      }
+    if (status != DRIVER_RUNNING && status != DRIVER_ABORTED) {
+      VLOG(1) << "Ignoring stop because the status of the driver is "
+      << Status_Name(status);
+      return status;
+    }
 
     // 'process' might be nullptr if the driver has failed to instantiate
     // it due to bad parameters (e.g. error in creating the detector
     // or loading flags).
-      if (process != nullptr) {
-        process->running.store(false);
-        dispatch(process, &MultiMasterSchedulerProcess::stop, failover);
-      }
+    if (process != nullptr) {
+      process->running.store(false);
+      dispatch(process, &MultiMasterSchedulerProcess::stop, failover);
+    }
 
     // TODO(benh): It might make more sense to clean up our local
     // cluster here than in the destructor. However, what would be
@@ -1940,260 +2161,262 @@ class MultiMesosSchedulerDriver: public MesosSchedulerDriver {
     // not use global vars in local.cpp) so that ours can just be an
     // instance variable in MesosSchedulerDriver.
 
-      bool aborted = status == DRIVER_ABORTED;
+    bool aborted = status == DRIVER_ABORTED;
 
-      status = DRIVER_STOPPED;
+    status = DRIVER_STOPPED;
 
-      return aborted ? DRIVER_ABORTED : status;
-    }
+    return aborted ? DRIVER_ABORTED : status;
   }
+}
 
-  Status abort()
-  {
-    synchronized (mutex) {
-      LOG(INFO) << "Asked to abort the driver";
+Status MultiMesosSchedulerDriver::abort()
+{
+  synchronized (mutex) {
+    LOG(INFO) << "Asked to abort the driver";
 
-      if (status != DRIVER_RUNNING) {
-        VLOG(1) << "Ignoring abort because the status of the driver is "
-        << Status_Name(status);
-        return status;
-      }
-
-      CHECK_NOTNULL(process);
-      process->running.store(false);
-
-    // Dispatching here ensures that we still process the outstanding
-    // requests *from* the scheduler, since those do proceed when
-    // aborted is true.
-      dispatch(process, &MultiMasterSchedulerProcess::abort);
-
-      return status = DRIVER_ABORTED;
+    if (status != DRIVER_RUNNING) {
+      VLOG(1) << "Ignoring abort because the status of the driver is "
+      << Status_Name(status);
+      return status;
     }
+
+    CHECK_NOTNULL(process);
+    process->running.store(false);
+
+  // Dispatching here ensures that we still process the outstanding
+  // requests *from* the scheduler, since those do proceed when
+  // aborted is true.
+    dispatch(process, &MultiMasterSchedulerProcess::abort);
+
+    return status = DRIVER_ABORTED;
   }
+}
 
-  Status join()
-  {
-    // We can use the process pointer to detect if the driver was ever
-    // started properly. If it wasn't, we return the current status
-    // (which should either be DRIVER_NOT_STARTED or DRIVER_ABORTED).
-    synchronized (mutex) {
-      if (process == nullptr) {
-        CHECK(status == DRIVER_NOT_STARTED || status == DRIVER_ABORTED);
-
-        return status;
-      }
-    }
-
-    // Otherwise, wait for stop() or abort() to trigger the latch.
-    CHECK_NOTNULL(latch)->await();
-
-    synchronized (mutex) {
-      CHECK(status == DRIVER_ABORTED || status == DRIVER_STOPPED);
+Status MultiMesosSchedulerDriver::join()
+{
+  // We can use the process pointer to detect if the driver was ever
+  // started properly. If it wasn't, we return the current status
+  // (which should either be DRIVER_NOT_STARTED or DRIVER_ABORTED).
+  synchronized (mutex) {
+    if (process == nullptr) {
+      CHECK(status == DRIVER_NOT_STARTED || status == DRIVER_ABORTED);
 
       return status;
     }
   }
 
-  Status run()
-  {
-    Status status = start();
-    return status != DRIVER_RUNNING ? status : join();
+  // Otherwise, wait for stop() or abort() to trigger the latch.
+  CHECK_NOTNULL(latch)->await();
+
+  synchronized (mutex) {
+    CHECK(status == DRIVER_ABORTED || status == DRIVER_STOPPED);
+
+    return status;
   }
+}
 
-  Status killTask(const TaskID& taskId)
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
+Status MultiMesosSchedulerDriver::run()
+{
+  Status status = start();
+  return status != DRIVER_RUNNING ? status : join();
+}
 
-      CHECK(process != nullptr);
-
-      dispatch(process, &MultiMasterSchedulerProcess::killTask, taskId);
-
+Status MultiMesosSchedulerDriver::killTask(const TaskID& taskId)
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
-  }
 
-  Status launchTasks(
+    CHECK(process != nullptr);
+
+    dispatch(process, &MultiMasterSchedulerProcess::killTask, taskId);
+
+    return status;
+  }
+}
+
+Status MultiMesosSchedulerDriver::launchTasks(
   const OfferID& offerId,
   const vector<TaskInfo>& tasks,
   const Filters& filters)
-  {
+{
   vector<OfferID> offerIds;
   offerIds.push_back(offerId);
 
   return launchTasks(offerIds, tasks, filters);
-  }
+}
 
-  Status launchTasks(
-    const vector<OfferID>& offerIds,
-    const vector<TaskInfo>& tasks,
-    const Filters& filters)
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(
-        process,
-        &MultiMasterSchedulerProcess::launchTasks,
-        offerIds, tasks, filters);
-
+Status MultiMesosSchedulerDriver::launchTasks(
+  const vector<OfferID>& offerIds,
+  const vector<TaskInfo>& tasks,
+  const Filters& filters)
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
-  }
 
-  Status acceptOffers(
+    CHECK(process != nullptr);
+
+    dispatch(
+      process,
+      &MultiMasterSchedulerProcess::launchTasks,
+      offerIds, tasks, filters);
+
+    return status;
+  }
+}
+
+Status MultiMesosSchedulerDriver::acceptOffers(
   const vector<OfferID>& offerIds,
   const vector<Offer::Operation>& operations,
   const Filters& filters)
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(
-        process,
-        &MultiMasterSchedulerProcess::acceptOffers,
-        offerIds,
-        operations,
-        filters);
-
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
+
+    CHECK(process != nullptr);
+
+    dispatch(
+      process,
+      &MultiMasterSchedulerProcess::acceptOffers,
+      offerIds,
+      operations,
+      filters);
+
+    return status;
   }
+}
 
-  Status declineOffer(const OfferID& offerId, const Filters& filters)
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(
-        process,
-        &MultiMasterSchedulerProcess::declineOffer,
-        offerId,
-        filters);
-
+Status MultiMesosSchedulerDriver::declineOffer(
+  const OfferID& offerId,
+  const Filters& filters)
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
+
+    CHECK(process != nullptr);
+
+    dispatch(
+      process,
+      &MultiMasterSchedulerProcess::declineOffer,
+      offerId,
+      filters);
+
+    return status;
   }
+}
 
-  Status reviveOffers()
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(process, &MultiMasterSchedulerProcess::reviveOffers);
-
+Status MultiMesosSchedulerDriver::reviveOffers()
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
+
+    CHECK(process != nullptr);
+
+    dispatch(process, &MultiMasterSchedulerProcess::reviveOffers);
+
+    return status;
   }
+}
 
-  Status suppressOffers()
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(process, &MultiMasterSchedulerProcess::suppressOffers);
-
+Status MultiMesosSchedulerDriver::suppressOffers()
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
+
+    CHECK(process != nullptr);
+
+    dispatch(process, &MultiMasterSchedulerProcess::suppressOffers);
+
+    return status;
   }
+}
 
-  Status acknowledgeStatusUpdate(const TaskStatus& taskStatus)
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-    // TODO(bmahler): Should this use abort() instead?
-      if (implicitAcknowlegements) {
-        ABORT("Cannot call acknowledgeStatusUpdate:"
-          " Implicit acknowledgements are enabled");
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(
-        process,
-        &MultiMasterSchedulerProcess::acknowledgeStatusUpdate,
-        taskStatus);
-
+Status MultiMesosSchedulerDriver::acknowledgeStatusUpdate(
+  const TaskStatus& taskStatus)
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
+
+  // TODO(bmahler): Should this use abort() instead?
+    if (implicitAcknowlegements) {
+      ABORT("Cannot call acknowledgeStatusUpdate:"
+        " Implicit acknowledgements are enabled");
+    }
+
+    CHECK(process != nullptr);
+
+    dispatch(
+      process,
+      &MultiMasterSchedulerProcess::acknowledgeStatusUpdate,
+      taskStatus);
+
+    return status;
   }
+}
 
-  Status sendFrameworkMessage(
-    const ExecutorID& executorId,
-    const SlaveID& slaveId,
-    const string& data)
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(process, &MultiMasterSchedulerProcess::sendFrameworkMessage,
-        executorId, slaveId, data);
-
+Status MultiMesosSchedulerDriver::sendFrameworkMessage(
+  const ExecutorID& executorId,
+  const SlaveID& slaveId,
+  const string& data)
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
+
+    CHECK(process != nullptr);
+
+    dispatch(process, &MultiMasterSchedulerProcess::sendFrameworkMessage,
+      executorId, slaveId, data);
+
+    return status;
   }
+}
 
-  Status reconcileTasks(
-  const vector<TaskStatus>& statuses)
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(process, &MultiMasterSchedulerProcess::reconcileTasks, statuses);
-
+Status MultiMesosSchedulerDriver::reconcileTasks(
+const vector<TaskStatus>& statuses)
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
+
+    CHECK(process != nullptr);
+
+    dispatch(process, &MultiMasterSchedulerProcess::reconcileTasks, statuses);
+
+    return status;
   }
+}
 
-  Status requestResources(
-  const vector<Request>& requests)
-  {
-    synchronized (mutex) {
-      if (status != DRIVER_RUNNING) {
-        return status;
-      }
-
-      CHECK(process != nullptr);
-
-      dispatch(
-        process,
-        &MultiMasterSchedulerProcess::requestResources,
-        requests);
-
+Status MultiMesosSchedulerDriver::requestResources(
+const vector<Request>& requests)
+{
+  synchronized (mutex) {
+    if (status != DRIVER_RUNNING) {
       return status;
     }
+
+    CHECK(process != nullptr);
+
+    dispatch(
+      process,
+      &MultiMasterSchedulerProcess::requestResources,
+      requests);
+
+    return status;
   }
-};
+}

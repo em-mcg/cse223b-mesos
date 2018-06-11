@@ -79,15 +79,10 @@ Try<shared_ptr<MasterDetector>> DetectorPool::get(const string url,
 }
 
 // Hide the constructors and assignment operator.
-DetectorPool::DetectorPool() {
-}
-
-DetectorPool::DetectorPool(const DetectorPool&) = delete;
-
-DetectorPool::DetectorPool& operator=(const DetectorPool&) = delete;
+DetectorPool::DetectorPool() {}
 
 // Internal Singleton.
-DetectorPool::DetectorPool* instance() {
+DetectorPool* DetectorPool::instance() {
     static DetectorPool* singleton = new DetectorPool();
     return singleton;
 }

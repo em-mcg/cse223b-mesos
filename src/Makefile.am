@@ -1034,7 +1034,9 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   resource_provider/manager.cpp						\
   resource_provider/registrar.cpp					\
   resource_provider/validation.cpp					\
+  sched/detector_pool.cpp			\
   sched/sched.cpp							\
+  sched/multimaster_sched.cpp   \
   scheduler/scheduler.cpp						\
   secret/resolver.cpp							\
   slave/compatibility.cpp						\
@@ -1187,6 +1189,7 @@ libmesos_no_3rdparty_la_SOURCES +=					\
   resource_provider/state.hpp						\
   resource_provider/validation.hpp					\
   sched/constants.hpp							\
+  sched/detector_pool.hpp					\
   sched/flags.hpp							\
   scheduler/constants.hpp						\
   scheduler/flags.hpp							\

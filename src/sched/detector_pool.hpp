@@ -14,6 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __DETECTOR_POOL_HPP__
+#define __DETECTOR_POOL_HPP__
+
 #ifndef __WINDOWS__
 #include <dlfcn.h>
 #endif // __WINDOWS__
@@ -59,7 +62,7 @@ public:
 
 private:
   // Hide the constructors and assignment operator.
-  DetectorPool() {}
+  DetectorPool();
   DetectorPool(const DetectorPool&) = delete;
   DetectorPool& operator=(const DetectorPool&) = delete;
 
@@ -74,3 +77,5 @@ private:
 
 } // namespace internal {
 } // namespace mesos {
+
+#endif // __DETECTOR_POOL_HPP__
