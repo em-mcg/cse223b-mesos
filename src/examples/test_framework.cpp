@@ -129,7 +129,8 @@ public:
         TaskInfo task;
         CommandInfo commandInfo;
 
-        commandInfo.mutable_value()->assign("echo `date`;sleep 100; echo `date`");
+        commandInfo.mutable_value()->assign(
+          "echo `date`;sleep 100; echo `date`");
         task.set_name("Task " + lexical_cast<string>(taskId));
         task.mutable_task_id()->set_value(lexical_cast<string>(taskId));
         task.mutable_slave_id()->MergeFrom(offer.slave_id());
