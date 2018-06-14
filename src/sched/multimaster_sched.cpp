@@ -161,7 +161,6 @@ bool doesMasterExist(std::vector<Option<MasterInfo>> masters,
 
 Option<MasterInfo> doesUPIDExist(std::vector<Option<MasterInfo>> masters,
   const UPID& from) {
-
   for (const Option<MasterInfo> m : masters) {
     if (from == m->pid()) {
       LOG(INFO) << "Matched master with PID " << m->pid();
@@ -236,41 +235,56 @@ protected:
 
     // TODO(benh): Get access to flags so that we can decide whether
     // or not to make ZooKeeper verbose.
-    install<FrameworkRegisteredMessage>(&MultiMasterSchedulerProcess::registered,
+    install<FrameworkRegisteredMessage>(
+      &MultiMasterSchedulerProcess::registered,
       &FrameworkRegisteredMessage::framework_id,
       &FrameworkRegisteredMessage::master_info);
 
-    install<FrameworkReregisteredMessage>(&MultiMasterSchedulerProcess::reregistered,
+    install<FrameworkReregisteredMessage>(
+      &MultiMasterSchedulerProcess::reregistered,
       &FrameworkReregisteredMessage::framework_id,
       &FrameworkReregisteredMessage::master_info);
 
-    install<ResourceOffersMessage>(&MultiMasterSchedulerProcess::resourceOffers,
-      &ResourceOffersMessage::offers, &ResourceOffersMessage::pids);
+    install<ResourceOffersMessage>(
+      &MultiMasterSchedulerProcess::resourceOffers,
+      &ResourceOffersMessage::offers,
+      &ResourceOffersMessage::pids);
 
-    install<RescindResourceOfferMessage>(&MultiMasterSchedulerProcess::rescindOffer,
+    install<RescindResourceOfferMessage>(
+      &MultiMasterSchedulerProcess::rescindOffer,
       &RescindResourceOfferMessage::offer_id);
 
-    install<StatusUpdateMessage>(&MultiMasterSchedulerProcess::statusUpdate,
-      &StatusUpdateMessage::update, &StatusUpdateMessage::pid);
+    install<StatusUpdateMessage>(
+      &MultiMasterSchedulerProcess::statusUpdate,
+      &StatusUpdateMessage::update,
+      &StatusUpdateMessage::pid);
 
-    install<LostSlaveMessage>(&MultiMasterSchedulerProcess::lostSlave,
+    install<LostSlaveMessage>(
+      &MultiMasterSchedulerProcess::lostSlave,
       &LostSlaveMessage::slave_id);
 
-    install<ExitedExecutorMessage>(&MultiMasterSchedulerProcess::lostExecutor,
-      &ExitedExecutorMessage::executor_id, &ExitedExecutorMessage::slave_id,
+    install<ExitedExecutorMessage>(
+      &MultiMasterSchedulerProcess::lostExecutor,
+      &ExitedExecutorMessage::executor_id,
+      &ExitedExecutorMessage::slave_id,
       &ExitedExecutorMessage::status);
 
-    install<ExecutorToFrameworkMessage>(&MultiMasterSchedulerProcess::frameworkMessage,
+    install<ExecutorToFrameworkMessage>(
+      &MultiMasterSchedulerProcess::frameworkMessage,
       &ExecutorToFrameworkMessage::slave_id,
       &ExecutorToFrameworkMessage::executor_id,
       &ExecutorToFrameworkMessage::data);
 
-    install<FrameworkErrorMessage>(&MultiMasterSchedulerProcess::error,
+    install<FrameworkErrorMessage>(
+      &MultiMasterSchedulerProcess::error,
       &FrameworkErrorMessage::message);
 
     // Start detecting masters.
     detector->detect().onAny(
-      defer(self(), &MultiMasterSchedulerProcess::detected, lambda::_1));
+      defer(
+        self(),
+        &MultiMasterSchedulerProcess::detected,
+        lambda::_1));
   }
 
   void detected(const Future<Option<MasterInfo>>& _master) {
@@ -818,7 +832,10 @@ protected:
     VLOG(1) << "Scheduler::reregistered took " << stopwatch.elapsed();
   }
 
-  void doReliableRegistration(Duration maxBackoff, Option<MasterInfo> newMaster) {
+  void doReliableRegistration(
+    Duration maxBackoff,
+    Option<MasterInfo> newMaster)
+  {
     if (!running.load()) {
       return;
     }
@@ -999,7 +1016,7 @@ protected:
         return;
       }
 
-      //CHECK_SOME(master);
+      // CHECK_SOME(master);
 
       if (master.isNone()) {
         VLOG(1) << "Ignoring status update message because it was sent "
@@ -1294,7 +1311,7 @@ void killTask(const TaskID& taskId)
   Call::Kill* kill = call.mutable_kill();
   kill->mutable_task_id()->CopyFrom(taskId);
 
-  //CHECK_SOME(master);
+  // CHECK_SOME(master);
   // TODO(erin): send this to right master
   // unregister from all active masters
   for (auto const& m : activeMasters) {
@@ -1303,7 +1320,7 @@ void killTask(const TaskID& taskId)
     }
   }
 
-  //send(master->pid(), call);
+  // send(master->pid(), call);
 }
 
 void requestResources(const vector<Request>& requests)
@@ -1324,7 +1341,7 @@ void requestResources(const vector<Request>& requests)
     request->add_requests()->CopyFrom(_request);
   }
 
-  //CHECK_SOME(master);
+  // CHECK_SOME(master);
   // TODO(erin): ask all or subset for resource
   // send(master->pid(), call);
   for (auto const& m : activeMasters) {
@@ -1480,7 +1497,7 @@ void acceptOffers(
   // Setting accept.filters.
   accept->mutable_filters()->CopyFrom(filters);
 
-  //CHECK_SOME(master);
+  // CHECK_SOME(master);
   // TODO(erin): figure out which master?
   send(sender, call);
 }
@@ -1541,7 +1558,7 @@ void reviveOffers()
       send(m->pid(), call);
     }
   }
-  //send(master->pid(), call);
+  // send(master->pid(), call);
 }
 
 void suppressOffers()
@@ -1728,7 +1745,9 @@ struct Metrics
   Metrics(const MultiMasterSchedulerProcess& schedulerProcess)
   : event_queue_messages(
     "scheduler/event_queue_messages",
-    defer(schedulerProcess, &MultiMasterSchedulerProcess::_event_queue_messages)),
+    defer(
+      schedulerProcess,
+      &MultiMasterSchedulerProcess::_event_queue_messages)),
   event_queue_dispatches(
     "scheduler/event_queue_dispatches",
     defer(schedulerProcess,
