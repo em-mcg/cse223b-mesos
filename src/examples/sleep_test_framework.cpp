@@ -44,7 +44,7 @@
 #include "logging/logging.hpp"
 #include "module/manager.hpp"
 
-#include "examples/flags.hpp"
+#include "examples/multimesos_flags.hpp"
 
 using namespace mesos;
 using mesos::modules::ModuleManager;

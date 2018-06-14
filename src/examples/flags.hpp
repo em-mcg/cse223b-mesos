@@ -104,7 +104,7 @@ public:
 
   Option<Modules> modules;
   Option<std::string> master_detector;
-  Option<std::string> master;
+  std::string master;
   bool authenticate;
   std::string principal;
   Option<std::string> secret;
