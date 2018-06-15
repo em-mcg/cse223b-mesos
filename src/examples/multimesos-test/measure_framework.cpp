@@ -13,23 +13,22 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#include <iostream>
-#include <string>
-#include <mutex>
-#include <cmath>
 #include <chrono>
+#include <cmath>
+#include <iostream>
+#include <mutex>
+#include <string>
 #include <vector>
 
 #include <boost/lexical_cast.hpp>
 
+#include <mesos/master/detector.hpp>
 #include <mesos/resources.hpp>
 #include <mesos/scheduler.hpp>
 #include <mesos/type_utils.hpp>
-#include <mesos/master/detector.hpp>
 
 #include <mesos/authorizer/acls.hpp>
 
-#include <stout/try.hpp>
 #include <stout/check.hpp>
 #include <stout/exit.hpp>
 #include <stout/flags.hpp>
@@ -39,6 +38,7 @@
 #include <stout/path.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
+#include <stout/try.hpp>
 
 #include <stout/os/realpath.hpp>
 
@@ -46,7 +46,7 @@
 #include "logging/logging.hpp"
 #include "module/manager.hpp"
 
-#include "examples/flags.hpp"
+#include "examples/multimesos_flags.hpp"
 
 using namespace mesos;
 
@@ -56,15 +56,15 @@ using std::cerr;
 using std::cout;
 using std::endl;
 using std::flush;
+using std::mutex;
 using std::string;
 using std::vector;
-using std::mutex;
 typedef std::chrono::high_resolution_clock Clock;
 
 using mesos::Resources;
 
-using mesos::modules::ModuleManager;
 using mesos::master::detector::MasterDetector;
+using mesos::modules::ModuleManager;
 
 vector<double> time_sample;
 const int SAMPLING_NUM = 3;
@@ -80,34 +80,34 @@ class TestScheduler : public Scheduler
 {
 public:
   TestScheduler(
-      bool _implicitAcknowledgements,
-      const ExecutorInfo& _executor,
-      const string& _role)
+    bool _implicitAcknowledgements,
+    const ExecutorInfo& _executor,
+    const string& _role)
     : implicitAcknowledgements(_implicitAcknowledgements),
       executor(_executor),
       role(_role),
       issued(false),
-      mutx(){}
+      mutx()
+  {}
 
   virtual ~TestScheduler() {}
 
-  virtual void registered(SchedulerDriver*,
-                          const FrameworkID&,
-                          const MasterInfo&)
+  virtual void registered(
+    SchedulerDriver*, const FrameworkID&, const MasterInfo&)
   {}
 
   virtual void reregistered(SchedulerDriver*, const MasterInfo& masterInfo) {}
 
   virtual void disconnected(SchedulerDriver* driver) {}
 
-  virtual void resourceOffers(SchedulerDriver* driver,
-                              const vector<Offer>& offers)
+  virtual void resourceOffers(
+    SchedulerDriver* driver, const vector<Offer>& offers)
   {
     foreach (const Offer& offer, offers) {
-
       Resources taskResources = Resources::parse(
-          "cpus:" + stringify(CPUS_PER_TASK) +
-          ";mem:" + stringify(MEM_PER_TASK)).get();
+                                  "cpus:" + stringify(CPUS_PER_TASK) +
+                                  ";mem:" + stringify(MEM_PER_TASK))
+                                  .get();
       taskResources.allocate(role);
 
       Resources remaining = offer.resources();
@@ -115,8 +115,7 @@ public:
       // Launch tasks.
       vector<TaskInfo> tasks;
 
-      if(!issued
-        && remaining.toUnreserved().contains(taskResources)) {
+      if (!issued && remaining.toUnreserved().contains(taskResources)) {
         mutx.lock();
         int taskId = 0;
 
@@ -162,49 +161,46 @@ public:
 
     int taskId = lexical_cast<int>(status.task_id().value());
 
-    if (status.state() == TASK_KILLED ||
-        status.state() == TASK_FAILED) {
+    if (status.state() == TASK_KILLED || status.state() == TASK_FAILED) {
       driver->abort();
     }
 
     if (!implicitAcknowledgements) {
       driver->acknowledgeStatusUpdate(status);
     }
-    if(status.state() == TASK_LOST){
+    if (status.state() == TASK_LOST) {
       issued = false;
     }
     if (status.state() == TASK_FINISHED) {
       // Record the time and exit
       auto end = Clock::now();
-      double interval = std::chrono::duration_cast<std::chrono::milliseconds>(end-start).count();
-      time_sample.push_back(interval/1e3);
+      double interval =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+          .count();
+      time_sample.push_back(interval / 1e3);
       issued = false;
       driver->stop();
     }
     mutx.unlock();
-
   }
 
   virtual void frameworkMessage(
-      SchedulerDriver* driver,
-      const ExecutorID& executorId,
-      const SlaveID& slaveId,
-      const string& data)
+    SchedulerDriver* driver,
+    const ExecutorID& executorId,
+    const SlaveID& slaveId,
+    const string& data)
   {}
 
   virtual void slaveLost(SchedulerDriver* driver, const SlaveID& sid) {}
 
   virtual void executorLost(
-      SchedulerDriver* driver,
-      const ExecutorID& executorID,
-      const SlaveID& slaveID,
-      int status)
+    SchedulerDriver* driver,
+    const ExecutorID& executorID,
+    const SlaveID& slaveID,
+    int status)
   {}
 
-  virtual void error(SchedulerDriver* driver, const string& message)
-  {
-
-  }
+  virtual void error(SchedulerDriver* driver, const string& message) {}
 
 private:
   const bool implicitAcknowledgements;
@@ -224,7 +220,8 @@ void usage(const char* argv0, const flags::FlagsBase& flags)
        << flags.usage();
 }
 
-class Flags : public virtual mesos::internal::examples::Flags {};
+class Flags : public virtual mesos::internal::examples::Flags
+{};
 
 int main(int argc, char** argv)
 {
@@ -235,7 +232,7 @@ int main(int argc, char** argv)
 
   // TODO(erin): change hacky workaround
   if (!flags.master.isSome()) {
-     flags.master = Option<std::string>("");
+    flags.master = Option<std::string>("");
   }
   if (flags.help) {
     return EXIT_SUCCESS;
@@ -269,19 +266,17 @@ int main(int argc, char** argv)
   framework.set_principal(flags.principal);
   framework.set_name(FRAMEWORK_NAME);
   framework.add_roles(flags.role);
+  framework.add_capabilities()->set_type(FrameworkInfo::Capability::MULTI_ROLE);
   framework.add_capabilities()->set_type(
-      FrameworkInfo::Capability::MULTI_ROLE);
-  framework.add_capabilities()->set_type(
-      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+    FrameworkInfo::Capability::RESERVATION_REFINEMENT);
   framework.set_checkpoint(flags.checkpoint);
 
   bool implicitAcknowledgements = true;
   if (os::getenv("MESOS_EXPLICIT_ACKNOWLEDGEMENTS").isSome()) {
-
     implicitAcknowledgements = false;
   }
 
-  if (flags.master == "local") {
+  if (flags.master.get() == "local") {
     // Configure master.
     os::setenv("MESOS_ROLES", flags.role);
     os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", stringify(flags.authenticate));
@@ -298,9 +293,9 @@ int main(int argc, char** argv)
 
   TestScheduler scheduler(implicitAcknowledgements, executor, flags.role);
 
-  for(int i=0;i<SAMPLING_NUM;i++){
+  for (int i = 0; i < SAMPLING_NUM; i++) {
     MultiMesosSchedulerDriver* driver;
-    if (flags.authenticate){
+    if (flags.authenticate) {
       Credential credential;
       credential.set_principal(flags.principal);
       if (flags.secret.isSome()) {
@@ -308,17 +303,14 @@ int main(int argc, char** argv)
       }
 
       driver = new MultiMesosSchedulerDriver(
-          &scheduler,
-          framework,
-          flags.master.get(),
-          implicitAcknowledgements,
-          credential);
+        &scheduler,
+        framework,
+        flags.master.get(),
+        implicitAcknowledgements,
+        credential);
     } else {
       driver = new MultiMesosSchedulerDriver(
-          &scheduler,
-          framework,
-          flags.master.get(),
-          implicitAcknowledgements);
+        &scheduler, framework, flags.master.get(), implicitAcknowledgements);
     }
     int status = driver->run() == DRIVER_STOPPED ? 0 : 1;
 
@@ -326,17 +318,17 @@ int main(int argc, char** argv)
     driver->stop();
     delete driver;
   }
-  double mean=0.0,std=0.0;
-  for(auto it : time_sample){
+  double mean = 0.0, std = 0.0;
+  for (auto it : time_sample) {
     mean += it;
   }
   mean /= time_sample.size();
-  for(auto it : time_sample){
-    std += (it-mean) * (it-mean);
+  for (auto it : time_sample) {
+    std += (it - mean) * (it - mean);
   }
   std /= time_sample.size();
   std = std::sqrt(std);
-  cout<<"Take "<<SAMPLING_NUM<<" Samples"<<endl;
-  cout<<"The delay is: "<<mean-10<<"/"<<std<<"s"<<endl;
+  cout << "Take " << SAMPLING_NUM << " Samples" << endl;
+  cout << "The delay is: " << mean - 10 << "/" << std << "s" << endl;
   return 0;
 }

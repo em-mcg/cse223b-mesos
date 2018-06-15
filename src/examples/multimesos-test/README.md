@@ -1,4 +1,4 @@
-# Scalability test for Single Master Mesos
+# Scalability test for Multi Master Mesos
 - bg_framework.cpp is the framework provide the background traffic
 - measure_framework.cpp is the framework used for measure, the result is output to stdout
 

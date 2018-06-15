@@ -14,20 +14,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <iostream>
-#include <string>
 #include <mutex>
 #include <random>
+#include <string>
 
 #include <boost/lexical_cast.hpp>
 
+#include <mesos/master/detector.hpp>
 #include <mesos/resources.hpp>
 #include <mesos/scheduler.hpp>
 #include <mesos/type_utils.hpp>
-#include <mesos/master/detector.hpp>
 
 #include <mesos/authorizer/acls.hpp>
 
-#include <stout/try.hpp>
 #include <stout/check.hpp>
 #include <stout/exit.hpp>
 #include <stout/flags.hpp>
@@ -37,6 +36,7 @@
 #include <stout/path.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
+#include <stout/try.hpp>
 
 #include <stout/os/realpath.hpp>
 
@@ -44,7 +44,7 @@
 #include "logging/logging.hpp"
 #include "module/manager.hpp"
 
-#include "examples/flags.hpp"
+#include "examples/multimesos_flags.hpp"
 
 using namespace mesos;
 
@@ -54,14 +54,14 @@ using std::cerr;
 using std::cout;
 using std::endl;
 using std::flush;
+using std::mutex;
 using std::string;
 using std::vector;
-using std::mutex;
 
 using mesos::Resources;
 
-using mesos::modules::ModuleManager;
 using mesos::master::detector::MasterDetector;
+using mesos::modules::ModuleManager;
 
 const int32_t CPUS_PER_TASK = 1;
 const int32_t MEM_PER_TASK = 32;
@@ -74,21 +74,21 @@ class TestScheduler : public Scheduler
 {
 public:
   TestScheduler(
-      bool _implicitAcknowledgements,
-      const ExecutorInfo& _executor,
-      const string& _role)
+    bool _implicitAcknowledgements,
+    const ExecutorInfo& _executor,
+    const string& _role)
     : implicitAcknowledgements(_implicitAcknowledgements),
       executor(_executor),
       role(_role),
       rdm_eng(),
-      distribution(30,10),
-      mutx(){}
+      distribution(30, 10),
+      mutx()
+  {}
 
   virtual ~TestScheduler() {}
 
-  virtual void registered(SchedulerDriver*,
-                          const FrameworkID&,
-                          const MasterInfo&)
+  virtual void registered(
+    SchedulerDriver*, const FrameworkID&, const MasterInfo&)
   {
     cout << "Registered!" << endl;
   }
@@ -97,16 +97,17 @@ public:
 
   virtual void disconnected(SchedulerDriver* driver) {}
 
-  virtual void resourceOffers(SchedulerDriver* driver,
-                              const vector<Offer>& offers)
+  virtual void resourceOffers(
+    SchedulerDriver* driver, const vector<Offer>& offers)
   {
     foreach (const Offer& offer, offers) {
       cout << "Received offer " << offer.id() << " with " << offer.resources()
            << endl;
 
       Resources taskResources = Resources::parse(
-          "cpus:" + stringify(CPUS_PER_TASK) +
-          ";mem:" + stringify(MEM_PER_TASK)).get();
+                                  "cpus:" + stringify(CPUS_PER_TASK) +
+                                  ";mem:" + stringify(MEM_PER_TASK))
+                                  .get();
       taskResources.allocate(role);
 
       Resources remaining = offer.resources();
@@ -114,21 +115,21 @@ public:
       // Launch tasks.
       vector<TaskInfo> tasks;
 
-      if(remaining.toUnreserved().contains(taskResources)) {
+      if (remaining.toUnreserved().contains(taskResources)) {
         mutx.lock();
         int taskId = tasksLaunched;
         mutx.unlock();
 
-        cout << "Launching task " << taskId << " using offer "
-             << offer.id() << endl;
+        cout << "Launching task " << taskId << " using offer " << offer.id()
+             << endl;
 
         TaskInfo task;
         CommandInfo commandInfo;
-        
-        double pick = distribution(rdm_eng);
-        int second = (pick>0)?floor(pick):0;
 
-        commandInfo.mutable_value()->assign("sleep "+std::to_string(second));
+        double pick = distribution(rdm_eng);
+        int second = (pick > 0) ? floor(pick) : 0;
+
+        commandInfo.mutable_value()->assign("sleep " + std::to_string(second));
         task.set_name("Task " + lexical_cast<string>(taskId));
         task.mutable_task_id()->set_value(lexical_cast<string>(taskId));
         task.mutable_slave_id()->MergeFrom(offer.slave_id());
@@ -171,14 +172,13 @@ public:
 
     cout << "Task " << taskId << " is in state " << status.state() << endl;
 
-    if (status.state() == TASK_LOST ||
-        status.state() == TASK_KILLED ||
-        status.state() == TASK_FAILED) {
-      cout << "Aborting because task " << taskId
-           << " is in unexpected state " << status.state()
-           << " with reason " << status.reason()
-           << " from source " << status.source()
-           << " with message '" << status.message() << "'" << endl;
+    if (
+      status.state() == TASK_LOST || status.state() == TASK_KILLED ||
+      status.state() == TASK_FAILED) {
+      cout << "Aborting because task " << taskId << " is in unexpected state "
+           << status.state() << " with reason " << status.reason()
+           << " from source " << status.source() << " with message '"
+           << status.message() << "'" << endl;
       driver->abort();
     }
 
@@ -193,23 +193,22 @@ public:
 
     cout << "Finished " << tasksFinished << " tasks" << endl;
     mutx.unlock();
-
   }
 
   virtual void frameworkMessage(
-      SchedulerDriver* driver,
-      const ExecutorID& executorId,
-      const SlaveID& slaveId,
-      const string& data)
+    SchedulerDriver* driver,
+    const ExecutorID& executorId,
+    const SlaveID& slaveId,
+    const string& data)
   {}
 
   virtual void slaveLost(SchedulerDriver* driver, const SlaveID& sid) {}
 
   virtual void executorLost(
-      SchedulerDriver* driver,
-      const ExecutorID& executorID,
-      const SlaveID& slaveID,
-      int status)
+    SchedulerDriver* driver,
+    const ExecutorID& executorID,
+    const SlaveID& slaveID,
+    int status)
   {}
 
   virtual void error(SchedulerDriver* driver, const string& message)
@@ -237,7 +236,8 @@ void usage(const char* argv0, const flags::FlagsBase& flags)
        << flags.usage();
 }
 
-class Flags : public virtual mesos::internal::examples::Flags {};
+class Flags : public virtual mesos::internal::examples::Flags
+{};
 
 
 int main(int argc, char** argv)
@@ -248,7 +248,7 @@ int main(int argc, char** argv)
 
   // TODO(erin): change hacky workaround
   if (!flags.master.isSome()) {
-     flags.master = Option<std::string>("");
+    flags.master = Option<std::string>("");
   }
 
   if (flags.help) {
@@ -284,10 +284,9 @@ int main(int argc, char** argv)
   framework.set_principal(flags.principal);
   framework.set_name(FRAMEWORK_NAME);
   framework.add_roles(flags.role);
+  framework.add_capabilities()->set_type(FrameworkInfo::Capability::MULTI_ROLE);
   framework.add_capabilities()->set_type(
-      FrameworkInfo::Capability::MULTI_ROLE);
-  framework.add_capabilities()->set_type(
-      FrameworkInfo::Capability::RESERVATION_REFINEMENT);
+    FrameworkInfo::Capability::RESERVATION_REFINEMENT);
   framework.set_checkpoint(flags.checkpoint);
 
   bool implicitAcknowledgements = true;
@@ -325,17 +324,14 @@ int main(int argc, char** argv)
     }
 
     driver = new MultiMesosSchedulerDriver(
-        &scheduler,
-        framework,
-        flags.master.get(),
-        implicitAcknowledgements,
-        credential);
+      &scheduler,
+      framework,
+      flags.master.get(),
+      implicitAcknowledgements,
+      credential);
   } else {
     driver = new MultiMesosSchedulerDriver(
-        &scheduler,
-        framework,
-        flags.master.get(),
-        implicitAcknowledgements);
+      &scheduler, framework, flags.master.get(), implicitAcknowledgements);
   }
 
   int status = driver->run() == DRIVER_STOPPED ? 0 : 1;
